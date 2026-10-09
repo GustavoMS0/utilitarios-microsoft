@@ -8,6 +8,10 @@ Scripts PowerShell para administração e auditoria de **Entra ID**, **Exchange 
 | [Sharepoint.ps1](Sharepoint.ps1) | Auditoria de uso e governança dos sites do SharePoint (e OneDrive) | Graph (+ SPO opcional) |
 | [Auditoriaexchange.ps1](Auditoriaexchange.ps1) | Liga/ajusta a auditoria em caixas de correio específicas | Exchange Online |
 | [ExtracaoExchange.ps1](ExtracaoExchange.ps1) | Relatório de quem moveu/apagou e-mails nessas caixas | Exchange Online |
+| [Recuperar-ItensExcluidos.ps1](Recuperar-ItensExcluidos.ps1) | Restaura e-mails/itens apagados (dentro do prazo de retenção), escolhendo um a um | Exchange Online |
+| [Backup-Caixa.ps1](Backup-Caixa.ps1) | Backup incremental de caixas com fidelidade total + índice pesquisável | Graph |
+| [Restaurar-Backup.ps1](Restaurar-Backup.ps1) | Restauração granular a partir do backup (por assunto, remetente, data, pasta) | Graph |
+| [Criar-AppBackup.ps1](Criar-AppBackup.ps1) | Cria o app registration com certificado para o backup rodar agendado | Graph |
 | [Criauser.ps1](Criauser.ps1) | **Obsoleto** — versão antiga do NewClone, mantida só como referência | Graph |
 
 ## Requisitos
@@ -114,6 +118,114 @@ Notas:
 
 ---
 
+## Backup e recuperação de caixas
+
+O Exchange Online não faz backup das caixas para você. Estas ferramentas cobrem dois cenários:
+
+| Situação | Ferramenta |
+|---|---|
+| Alguém apagou e-mails **nos últimos 14–30 dias** | `Recuperar-ItensExcluidos.ps1`: usa a lixeira interna do Exchange, sem precisar de backup |
+| Apagado há mais tempo, caixa comprometida, funcionário desligado, cópia fora do Microsoft 365 | `Backup-Caixa.ps1` + `Restaurar-Backup.ps1` |
+
+> Para aumentar a lixeira interna para o máximo de 30 dias:
+> `Get-Mailbox -ResultSize Unlimited | Set-Mailbox -RetainDeletedItemsFor 30`
+
+### Recuperar-ItensExcluidos.ps1
+
+Lista os itens das pastas *Itens Excluídos* e *Itens Recuperáveis*, deixa escolher quais restaurar
+(números, intervalos como `5-8`, ou `T` para todos) e os devolve à pasta original, ou a `-PastaDestino`.
+
+```powershell
+.\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto
+.\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Tipo IPM.Note -De (Get-Date).AddDays(-3) -PastaDestino Recuperados
+```
+
+**Permissão:** função *Mailbox Import Export* (não vem atribuída a ninguém por padrão):
+
+```powershell
+New-ManagementRoleAssignment -Role "Mailbox Import Export" -User admin@empresa.com.br
+```
+
+### Backup-Caixa.ps1
+
+Usa a [API de import/export de caixas do Microsoft Graph](https://learn.microsoft.com/graph/mailbox-import-export-concept-overview), que substitui o EWS (desativado no Exchange Online em outubro de 2026).
+
+- **Fidelidade total:** e-mails, calendário, contatos e tarefas, com anexos e propriedades.
+- **Incremental:** a 1ª execução copia tudo; as seguintes, só o que mudou.
+- **Nada é perdido:** itens apagados na caixa continuam no backup (coluna `RemovidoEm`).
+- **Índice pesquisável** (`indice.csv`, abre no Excel): data, pasta, assunto, remetente, destinatários, anexo e tamanho.
+
+```
+C:\Backup\Exchange\
+├─ logs\backup-<data>.log
+└─ financeiro@empresa.com.br\
+   ├─ itens\2026\09\*.fts      ← conteúdo (formato opaco, só para restaurar)
+   ├─ indice.csv
+   ├─ estado.json             ← controle do incremental
+   └─ falhas.log
+```
+
+```powershell
+# Login interativo
+.\Backup-Caixa.ps1 -Caixas financeiro@empresa.com.br
+
+# Como aplicativo (agendado)
+.\Backup-Caixa.ps1 -Caixas financeiro@empresa.com.br, boletos@empresa.com.br `
+    -TenantId <tenant-id> -ClientId <app-id> -CertificateThumbprint <thumbprint>
+```
+
+| Parâmetro | Padrão | Descrição |
+|---|---|---|
+| `-Caixas` | — | Caixas a copiar (usuário ou compartilhada) |
+| `-Destino` | `C:\Backup\Exchange` | Pasta do backup; use um disco/compartilhamento fora do servidor |
+| `-ExcluirPastas` | — | Caminhos a ignorar, com curinga (`'Lixo Eletrônico'`, `'Inbox/Newsletter*'`) |
+| `-TenantId` `-ClientId` `-CertificateThumbprint` | — | Modo aplicativo |
+
+O script sai com código ≠ 0 se alguma caixa tiver falhas, e o Agendador de Tarefas mostra isso como erro.
+
+### Restaurar-Backup.ps1
+
+Filtra o índice, deixa escolher os itens e os reimporta numa pasta nova (**Restaurados &lt;data&gt;**) na caixa,
+recriando dentro dela as pastas originais. Nada que já existe na caixa é alterado.
+
+```powershell
+# E-mails apagados com "boleto" no assunto em setembro
+.\Restaurar-Backup.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto -De 2026-09-01 -Ate 2026-09-30 -SomenteRemovidos
+
+# Tudo de um fornecedor, da caixa de um ex-funcionário para a caixa do gestor
+.\Restaurar-Backup.ps1 -Caixa ex.funcionario@empresa.com.br -CaixaDestino gestor@empresa.com.br -Remetente fornecedor.com.br -Todos
+```
+
+Filtros: `-Assunto`, `-Remetente` (nome ou e-mail), `-Pasta` (curinga), `-De`, `-Ate`, `-SomenteRemovidos`.
+Opções: `-CaixaDestino`, `-PastaRestauracao`, `-SemEstrutura`, `-GridView` (seleção em janela), `-Todos`, `-Force`.
+
+### Login: interativo ou aplicativo
+
+| | Interativo | Aplicativo (`Criar-AppBackup.ps1`) |
+|---|---|---|
+| Configuração | Nenhuma | Cria um app no Entra ID com certificado |
+| Agendamento | Não | Sim |
+| Alcance | Caixas em que sua conta tem permissão | **Todas** as caixas do tenant |
+| Permissões Graph | `MailboxFolder.Read`, `MailboxItem.Read`, `MailboxItem.Export`, `User.Read.All` (restaurar: `MailboxFolder.ReadWrite`, `MailboxItem.ImportExport`) | Mesmas, na versão `.All` de aplicativo |
+
+```powershell
+# Só backup
+.\Criar-AppBackup.ps1
+# Backup + restauração; certificado no repositório da máquina (tarefa agendada com outra conta)
+.\Criar-AppBackup.ps1 -PermitirRestauracao -Repositorio LocalMachine
+```
+
+O script mostra o TenantId, o ClientId e o Thumbprint, além do comando pronto para agendar. Exige Administrador Global
+(ou Administrador de Função Privilegiada) para o consentimento; com `-SemConsentimento`, conceda depois no portal.
+
+> ⚠️ Com permissão de aplicativo, quem tiver o certificado lê **qualquer** caixa do tenant. Mantenha o
+> certificado só no servidor de backup e restrinja o acesso à pasta do backup.
+
+> A Microsoft indica o [Microsoft 365 Backup](https://learn.microsoft.com/microsoft-365/backup/backup-overview)
+> como solução oficial de backup. Estes scripts são uma alternativa sem custo, com cópia fora do Microsoft 365.
+
+---
+
 ## Testes
 
 Testes offline: os cmdlets do Graph/Exchange são simulados, nada é alterado no tenant.
@@ -122,4 +234,4 @@ Testes offline: os cmdlets do Graph/Exchange são simulados, nada é alterado no
 pwsh -NoProfile -File .\tests\Run-Tests.ps1
 ```
 
-Cobrem sintaxe de todos os scripts, a lógica do relatório do SharePoint, a configuração de auditoria, a extração/paginação do audit log e a decisão Graph × Exchange do NewClone.
+Cobrem sintaxe de todos os scripts, a lógica do relatório do SharePoint, a configuração de auditoria, a extração/paginação do audit log, a decisão Graph × Exchange do NewClone e, com uma caixa simulada, o backup incremental (paginação, itens apagados/alterados, token expirado, falhas), a restauração com filtros e a criação do app.
