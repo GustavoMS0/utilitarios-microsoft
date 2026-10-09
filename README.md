@@ -12,7 +12,6 @@ Scripts PowerShell para administração e auditoria de **Entra ID**, **Exchange 
 | [Backup-Caixa.ps1](Backup-Caixa.ps1) | Backup incremental de caixas com fidelidade total + índice pesquisável | Graph |
 | [Restaurar-Backup.ps1](Restaurar-Backup.ps1) | Restauração granular a partir do backup (por assunto, remetente, data, pasta) | Graph |
 | [Criar-AppBackup.ps1](Criar-AppBackup.ps1) | Cria o app registration com certificado para o backup rodar agendado | Graph |
-| [Criauser.ps1](Criauser.ps1) | **Obsoleto** — versão antiga do NewClone, mantida só como referência | Graph |
 
 ## Requisitos
 
