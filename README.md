@@ -12,6 +12,7 @@ Scripts PowerShell para administração e auditoria de **Entra ID**, **Exchange 
 | [Backup-Caixa.ps1](Backup-Caixa.ps1) | Backup incremental de caixas com fidelidade total + índice pesquisável | Graph |
 | [Restaurar-Backup.ps1](Restaurar-Backup.ps1) | Restauração granular a partir do backup (por assunto, remetente, data, pasta) | Graph |
 | [Criar-AppBackup.ps1](Criar-AppBackup.ps1) | Cria o app registration com certificado para o backup rodar agendado | Graph |
+| [Exportar-PST.ps1](Exportar-PST.ps1) | Exporta a caixa de um colaborador (ex: desligado) para PST com as pastas originais | Purview (Graph) |
 
 ## Requisitos
 
@@ -220,6 +221,60 @@ O script mostra o TenantId, o ClientId e o Thumbprint, além do comando pronto p
 > ⚠️ Com permissão de aplicativo, quem tiver o certificado lê **qualquer** caixa do tenant. Mantenha o
 > certificado só no servidor de backup e restrinja o acesso à pasta do backup.
 
+### Exportar-PST.ps1: PST de colaborador desligado (Purview)
+
+Para administradores. Exporta a caixa de um colaborador (inteira ou só o que você escolher) em **PST com a estrutura de pastas original**, pelo
+**Microsoft Purview eDiscovery** (API do Graph). É o mesmo processo do portal, sem Outlook e sem acesso à caixa.
+
+```powershell
+.\Exportar-PST.ps1 -Caixa ex.colaborador@empresa.com.br                                    # caixa inteira
+.\Exportar-PST.ps1 -Caixa ex.colaborador@empresa.com.br -Conteudo Email, Calendario -De 2025-01-01
+.\Exportar-PST.ps1 -Caixa ex.colaborador@empresa.com.br -SemDownload                       # baixar depois
+.\Exportar-PST.ps1 -Caixa ex.colaborador@empresa.com.br -SomenteDownload                   # baixa a última exportação, sem exportar de novo
+```
+
+**Escolher o que exportar** (o filtro é aplicado na pesquisa do Purview: só o selecionado é exportado):
+
+| Parâmetro | Opções |
+|---|---|
+| `-Conteudo` | `Tudo` (padrão), `Email`, `Calendario`, `Contatos`, `Tarefas`, `Notas`, `Teams` (chats e reuniões). Combine com vírgula: `-Conteudo Email, Calendario` |
+| `-De` / `-Ate` | Período pela data de recebimento, no formato **AAAA-MM-DD** (`01/07/2026` seria lido como 7 de janeiro). Itens sem essa data, como contatos, ficam de fora quando usado |
+| `-Consulta` | KQL livre, combinada com os filtros acima (ex: `-Consulta 'from:fornecedor.com.br'`) |
+| `-IncluirNaoIndexados` | Com filtros, itens não indexados (ex: anexos criptografados) ficam de fora porque não dá para saber se correspondem; esta opção os inclui |
+
+Exemplo: caixa inteira **sem os chats do Teams**: `-Conteudo Email, Calendario, Contatos, Tarefas, Notas`.
+
+O que ele faz:
+1. Cria um **caso de eDiscovery** ("Exportação PST - &lt;caixa&gt; - &lt;data&gt;") e uma pesquisa com o conteúdo escolhido
+2. Calcula a **estimativa** (itens e GB) antes de exportar
+3. **Exporta em PST** com a estrutura de pastas, incluindo os Itens Recuperáveis (excluídos/expurgados)
+4. **Baixa** o pacote e extrai o(s) PST(s) em `<Destino>\<nome do caso>\`
+
+O download pede um **segundo login no navegador** (a conta já vem sugerida): os arquivos ficam num serviço do Purview que
+não aceita o login do Graph. Se o download falhar, a exportação continua pronta no Purview: rode de novo com
+`-SomenteDownload` para baixar **sem exportar outra vez** (ou acrescente `-CodigoDispositivo` para entrar com um código em
+https://microsoft.com/devicelogin). O caso fica no Purview como registro da exportação e pode ser fechado no portal.
+
+Sobre o PST gerado pelo Purview:
+- Os nomes das pastas vêm com **hífen no lugar de espaço** (`Caixa-de-Entrada`) e ficam dentro de
+  `Início-do-Repositório-de-Informações`; é o padrão do Purview, inclusive pelo portal.
+- Com `-Conteudo Tudo`, entram também os **chats do Teams** (`TeamsMessagesData`), que ficam guardados na caixa de correio.
+- O pacote pode trazer alguns arquivos de sistema (`SubstrateFiles`, `.json`) que não são conteúdo do usuário.
+
+**Requisitos do tenant:**
+- Conta do administrador no grupo de funções **eDiscovery Manager** (*Purview > Funções e escopos*).
+- **Serviço de download do Purview registrado no tenant** (configuração única). Se faltar, o script pergunta e registra
+  na hora (exige Administrador Global ou de Aplicativos); use `-RegistrarServicoDownload` para não perguntar.
+- Conforme a licença, a Microsoft pode exigir o **Purview pay-as-you-go** para usar a API de eDiscovery
+  (*Purview > Configurações > Faturamento*; [cobrança](https://learn.microsoft.com/purview/edisc-billing) pelo volume
+  exportado, com franquia mensal). Em tenants com os recursos premium do eDiscovery habilitados, funciona sem ele.
+
+Sem esses requisitos, o script explica o que falta e mostra o caminho manual pelo portal do Purview.
+
+> **Antes de remover a licença do colaborador**, converta a caixa em compartilhada:
+> `Set-Mailbox -Identity ex.colaborador@empresa.com.br -Type Shared`. Uma caixa de usuário sem licença é **excluída
+> após 30 dias**. A compartilhada é preservada sem custo (até 50 GB).
+
 > A Microsoft indica o [Microsoft 365 Backup](https://learn.microsoft.com/microsoft-365/backup/backup-overview)
 > como solução oficial de backup. Estes scripts são uma alternativa sem custo, com cópia fora do Microsoft 365.
 
@@ -233,4 +288,4 @@ Testes offline: os cmdlets do Graph/Exchange são simulados, nada é alterado no
 pwsh -NoProfile -File .\tests\Run-Tests.ps1
 ```
 
-Cobrem sintaxe de todos os scripts, a lógica do relatório do SharePoint, a configuração de auditoria, a extração/paginação do audit log, a decisão Graph × Exchange do NewClone e, com uma caixa simulada, o backup incremental (paginação, itens apagados/alterados, token expirado, falhas), a restauração com filtros e a criação do app.
+Cobrem sintaxe de todos os scripts, a lógica do relatório do SharePoint, a configuração de auditoria, a extração/paginação do audit log, a decisão Graph × Exchange do NewClone e, com uma caixa simulada, o backup incremental (paginação, itens apagados/alterados, token expirado, falhas), a restauração com filtros, a criação do app e, com um Purview simulado, a exportação em PST (filtros, custodiante, login e retomada do download).

@@ -503,6 +503,274 @@ Assert ($global:app.Atribuicoes.Count -eq 0)                            "-SemCon
 Remove-Mocks 'New-SelfSignedCertificate','Invoke-MgGraphRequest','Get-MgContext','Connect-MgGraph','Import-Module','Get-FakeFolders','New-FakeFolder','Install-Module'
 
 
+
+
+
+# ==============================================================================
+Write-Host "`n== Exportar-PST.ps1 ==" -ForegroundColor Cyan
+# ==============================================================================
+# Purview simulado: caso, pesquisa, custodiante, estimativa, exportação e download
+$zipFake = Join-Path $tmp 'pv-pacote.zip'
+$dirZip  = Join-Path $tmp 'pv-pacote'
+New-Item -ItemType Directory (Join-Path $dirZip 'Exchange') -Force | Out-Null
+Set-Content (Join-Path $dirZip 'Exchange\ex@x.com.pst') 'PST simulado'
+Set-Content (Join-Path $dirZip 'Summary.csv') 'relatorio'
+Compress-Archive -Path (Join-Path $dirZip '*') -DestinationPath $zipFake -Force
+
+function New-ErroToken([string]$Codigo) {
+    $er = [System.Management.Automation.ErrorRecord]::new([Exception]::new('HTTP 400'), 'Token', 'InvalidOperation', $null)
+    $er.ErrorDetails = [System.Management.Automation.ErrorDetails]::new("{`"error`":`"$Codigo`"}")
+    $er
+}
+# Mesmo formato do Invoke-MgGraphRequest real: requisição HTTP inteira + JSON no final
+function New-ErroGraph([string]$Codigo, [string]$Mensagem) {
+    $json = @{ error = @{ code = $Codigo; message = $Mensagem } } | ConvertTo-Json -Compress
+    $dump = "POST https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases`nHTTP/1.1 400 Bad Request`nclient-request-id: 163fac04-7c26-43d0-958c-403d23127f74`n`n$json"
+    $er = [System.Management.Automation.ErrorRecord]::new([Exception]::new('Response status code does not indicate success: BadRequest (Bad Request).'), 'Graph', 'InvalidOperation', $null)
+    $er.ErrorDetails = [System.Management.Automation.ErrorDetails]::new($dump)
+    $er
+}
+function Reset-Purview {
+    $global:pv = @{
+        Chamadas = [System.Collections.Generic.List[object]]::new()
+        Downloads = [System.Collections.Generic.List[object]]::new()
+        Estimativa = 0; Export = 0; Token = 0
+        Itens = 120; FalharExport = $false; StatusExport = 'succeeded'; FalharCaso = $false
+        AceitaFonteEmbutida = $true; FalharDownload = $false; ErroLogin = $null; TokenBody = $null; UrlLogin = $null
+    }
+}
+
+function global:Get-MgContext { [pscustomobject]@{ Account = 'admin@x.com'; TenantId = 'tenant-1'; AuthType = 'Delegated'; Scopes = @('eDiscovery.ReadWrite.All') } }
+function global:Connect-MgGraph { }
+function global:Import-Module { }
+function global:Install-Module { }
+function global:Start-Sleep { }
+function global:Invoke-MgGraphRequest { param($Method = 'GET', $Uri, $Body, $Headers, $ContentType, $ErrorAction)
+    $b = if ($Body) { $Body | ConvertFrom-Json } else { $null }
+    $global:pv.Chamadas.Add([pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $b; Headers = $Headers })
+    switch -Regex ($Uri) {
+        'ediscoveryCases$' {
+            if ($Method -eq 'GET') {
+                return @{ value = @(
+                    @{ id = 'outro'; displayName = 'Outro caso';                              createdDateTime = '2026-10-09T12:00:00Z' }
+                    @{ id = 'caso0'; displayName = 'Exportação PST - ex@x.com - 2026-10-01 0900'; createdDateTime = '2026-10-01T09:00:00Z' }
+                    @{ id = 'caso2'; displayName = 'Exportação PST - ex@x.com - 2026-10-09 1215'; createdDateTime = '2026-10-09T12:15:00Z' }
+                ) }
+            }
+            if ($global:pv.FalharCaso) { throw (New-ErroGraph 'BadRequest' 'Invalid case displayName') }
+            return @{ id = 'caso1' }
+        }
+        '/searches$' {
+            $temFonte = ($b.PSObject.Properties.Name -contains 'additionalSources' -and $global:pv.AceitaFonteEmbutida) -or
+                        ($b.PSObject.Properties.Name -contains 'custodianSources@odata.bind')
+            if (-not $temFonte) { throw (New-ErroGraph 'BadRequest' 'At least one data source is required.') }
+            return @{ id = 'pesq1' }
+        }
+        'v1.0/servicePrincipals$'           { $global:pv.SPRegistrado = $true; $global:pv.SPBody = $b; return @{ id = 'sp1' } }
+        '/custodians$'                       { return @{ id = 'cust1' } }
+        '/custodians/cust1/userSources$'     { return @{ id = 'us1'; includedSources = 'mailbox' } }
+        '/custodians/cust1/release$'         { return $null }
+        '/estimateStatistics$'               { return @{} }
+        '/lastEstimateStatisticsOperation$' {
+            $global:pv.Estimativa++
+            if ($global:pv.Estimativa -eq 1) { throw (New-HttpError 404) }   # ainda sendo criada
+            if ($global:pv.Estimativa -eq 2) { return @{ status = 'running'; percentProgress = 40 } }
+            return @{ status = 'succeeded'; indexedItemCount = $global:pv.Itens; indexedItemsSize = 1073741824; unindexedItemCount = $(if ($global:pv.Itens) { 2 } else { 0 }) }
+        }
+        '/exportResult$' {
+            if ($global:pv.FalharExport) { throw (New-ErroGraph 'Forbidden' 'Usage of eDiscovery APIs requires a subscription to Purview pay-as-you-go billing.') }
+            return $null
+        }
+        '/operations$' {
+            return @{ value = @(
+                @{ id = 'opEst'; action = 'estimateStatistics'; createdDateTime = '2026-10-09T10:00:00Z' }
+                @{ id = 'opExp'; action = 'exportResult';       createdDateTime = '2026-10-09T10:05:00Z'; status = 'succeeded' }
+            ) }
+        }
+        '/operations/opExp$' {
+            $global:pv.Export++
+            if ($global:pv.Export -eq 1) { return @{ status = 'running'; percentProgress = 50 } }
+            return @{ status = $global:pv.StatusExport; resultInfo = @{ message = 'Falha simulada' }
+                      exportFileMetadata = $(if ($global:pv.SemArquivos) { @() } else { @(@{ fileName = 'Exports.zip'; downloadUrl = 'https://proxy.purview/exp/abc'; size = 2048 }) }) }
+        }
+    }
+    throw "Rota não simulada: $Method $Uri"
+}
+function global:Invoke-RestMethod { param($Method, $Uri, $Body, $ErrorAction)
+    if ($Uri -like '*/devicecode') {
+        $global:pv.Escopo = $Body.scope
+        return [pscustomobject]@{ message = 'Acesse https://microsoft.com/devicelogin e use o código ABC'; device_code = 'dc1'; interval = 1; expires_in = 900 }
+    }
+    if ($Uri -like '*/token' -and $Body.grant_type -eq 'authorization_code') {
+        $global:pv.TokenBody = $Body
+        return [pscustomobject]@{ access_token = 'tok123' }
+    }
+    if ($Uri -like '*/token') {
+        $global:pv.Token++
+        if ($global:pv.Token -eq 1) { throw (New-ErroToken 'authorization_pending') }
+        return [pscustomobject]@{ access_token = 'tok123' }
+    }
+    throw "Rota não simulada: $Uri"
+}
+function global:Start-Process { param($FilePath)
+    $global:pv.UrlLogin = $FilePath
+    $q = @{}
+    foreach ($par in ($FilePath -split '\?', 2)[1] -split '&') { $k, $v = $par -split '=', 2; $q[$k] = [uri]::UnescapeDataString($v) }
+    if (-not $global:clienteHttp) { Add-Type -AssemblyName System.Net.Http; $global:clienteHttp = [System.Net.Http.HttpClient]::new() }
+    $resposta = if ($global:pv.ErroLogin -and -not $global:pv.SPRegistrado) { "error=access_denied&error_description=$([uri]::EscapeDataString($global:pv.ErroLogin))&state=$($q.state)" }
+                else { "code=abc&state=$($q.state)" }
+    $global:pv.RespostaLogin = $global:clienteHttp.GetAsync("$($q.redirect_uri)?$resposta")
+}
+function global:Invoke-WebRequest { param($Uri, $Headers, $OutFile, $ErrorAction, [switch]$UseBasicParsing)
+    if ($global:pv.FalharDownload) { throw 'Falha simulada no download' }
+    $global:pv.Downloads.Add([pscustomobject]@{ Uri = $Uri; Headers = $Headers })
+    Copy-Item $zipFake $OutFile
+}
+
+$exportar = Join-Path $raiz 'Exportar-PST.ps1'
+function Get-Chamada([string]$Padrao) { $global:pv.Chamadas | Where-Object { $_.Uri -match $Padrao } | Select-Object -First 1 }
+function Get-Avisos([scriptblock]$Bloco) { & $Bloco 3>&1 6>$null | Where-Object { $_ -is [System.Management.Automation.WarningRecord] } }
+
+# 1) Exportação completa com download (fonte embutida na pesquisa)
+Reset-Purview
+$dirPst = Join-Path $tmp 'pv1'
+& $exportar -Caixa 'ex@x.com' -Destino $dirPst 3>$null 6>$null | Out-Null
+$exitPv   = $LASTEXITCODE
+$caso     = Get-Chamada 'ediscoveryCases$'
+$pesquisa = Get-Chamada '/searches$'
+$exp      = Get-Chamada '/exportResult$'
+$down     = $global:pv.Downloads | Select-Object -First 1
+$psts     = @(Get-ChildItem $dirPst -Recurse -Filter *.pst)
+
+Assert ($caso.Body.displayName -like 'Exportação PST - ex@x.com - *')    "cria um caso de eDiscovery identificado com a caixa"
+Assert (-not ($pesquisa.Body.PSObject.Properties.Name -contains 'contentQuery')) "pesquisa sem condições: não envia contentQuery (caixa inteira)"
+Assert ($pesquisa.Body.additionalSources[0].email -eq 'ex@x.com' -and $pesquisa.Body.additionalSources[0].includedSources -eq 'mailbox') "a pesquisa já nasce com a caixa do colaborador como fonte (só caixa de correio)"
+Assert (-not (Get-Chamada '/custodians'))                                "com fonte embutida aceita: não cria custodiante (nem retenção)"
+Assert ($global:pv.Estimativa -ge 3)                                     "aguarda a estimativa (404 inicial e 'running' não são erro)"
+Assert ($exp.Body.exportFormat -eq 'pst' -and $exp.Body.additionalOptions -match 'includeFolderAndPath') "exporta em PST com a estrutura de pastas original"
+Assert ($exp.Body.exportCriteria -match 'partiallyIndexed')              "inclui itens não indexados (ex: anexos criptografados)"
+Assert ($exp.Headers.Prefer -eq 'include-unknown-enum-members')          "envia o cabeçalho das enumerações novas (exportResult, includeFolderAndPath)"
+Assert ($global:pv.UrlLogin -match 'scope=b26e684c-5068-4120-a679-64a5d2c909d9%2FeDiscovery.Download.Read' -and $global:pv.UrlLogin -match 'code_challenge_method=S256' -and $global:pv.UrlLogin -match 'login_hint=admin%40x.com') "login do download no navegador, no serviço do Purview (PKCE, conta sugerida)"
+Assert ($global:pv.TokenBody.code -eq 'abc' -and $global:pv.TokenBody.code_verifier -and $global:pv.TokenBody.redirect_uri -like 'http://localhost:*/' -and $global:pv.Token -eq 0) "troca o código recebido em localhost pelo token (sem código de dispositivo)"
+Assert ($down.Uri -eq 'https://proxy.purview/exp/abc' -and $down.Headers.Authorization -eq 'Bearer tok123' -and $down.Headers.'X-AllowWithAADToken' -eq 'true') "baixa o arquivo com o token e o cabeçalho exigidos"
+Assert ($psts.Count -eq 1 -and $psts[0].Name -eq 'ex@x.com.pst')         "extrai o PST do pacote baixado"
+Assert (@(Get-ChildItem $dirPst -Recurse -Filter *.zip).Count -eq 0)    "remove o .zip depois de extrair"
+Assert ($exitPv -eq 0)                                                   "código de saída 0"
+
+# 1b) API exige a fonte por custodiante (o erro visto no tenant real)
+Reset-Purview
+$global:pv.AceitaFonteEmbutida = $false
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1b') -SemDownload 3>$null 6>$null | Out-Null
+$exitCust = $LASTEXITCODE
+$us       = Get-Chamada '/custodians/cust1/userSources$'
+$vinculo  = @($global:pv.Chamadas | Where-Object { $_.Uri -match '/searches$' })[-1].Body.'custodianSources@odata.bind'
+Assert ((Get-Chamada '/custodians$').Body.email -eq 'ex@x.com' -and $us.Body.includedSources -eq 'mailbox') "plano B: custodiante com fonte só da caixa de correio"
+Assert ($vinculo -contains 'https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases/caso1/custodians/cust1/userSources/us1') "plano B: pesquisa vinculada à fonte do custodiante"
+Assert ((Get-Chamada '/custodians/cust1/release$') -and $exitCust -eq 0) "plano B: libera o custodiante no final (sem retenção na caixa)"
+
+# 1c) Erro no meio com custodiante: libera mesmo assim
+Reset-Purview
+$global:pv.AceitaFonteEmbutida = $false; $global:pv.FalharExport = $true
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1c') 3>$null 6>$null | Out-Null
+Assert ($LASTEXITCODE -eq 1 -and (Get-Chamada '/custodians/cust1/release$')) "erro na exportação: o custodiante é liberado mesmo assim"
+
+# 1d) Erro do Graph: mostra a etapa e a mensagem, sem falso alarme de permissão
+Reset-Purview
+$global:pv.FalharCaso = $true
+$avisos = Get-Avisos { & $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1d') }
+Assert ($LASTEXITCODE -eq 1 -and @($avisos | Where-Object { $_.Message -match "etapa 'criar caso': BadRequest: Invalid case displayName" }).Count -eq 1) "erro do Graph: mostra a etapa e o código/mensagem extraídos do JSON"
+Assert (-not ($avisos | Where-Object Message -match 'eDiscovery Manager'))  "'403' dentro do client-request-id não vira falso alarme de permissão"
+
+# 1e) -SomenteDownload: pega o caso mais recente da caixa e não exporta de novo
+Reset-Purview
+$global:pv.Export = 1   # exportação já concluída no Purview
+$dirRet = Join-Path $tmp 'pv1e'
+& $exportar -Caixa 'ex@x.com' -Destino $dirRet -SomenteDownload 3>$null 6>$null | Out-Null
+Assert ($LASTEXITCODE -eq 0 -and -not ($global:pv.Chamadas | Where-Object { $_.Method -eq 'POST' }))   "-SomenteDownload: não cria caso nem exportação"
+Assert ((Get-Chamada '/caso2/operations$') -and -not (Get-Chamada '/caso0/'))                          "-SomenteDownload: usa o caso mais recente daquela caixa"
+Assert (@(Get-ChildItem $dirRet -Recurse -Filter *.pst).Count -eq 1 -and (Test-Path (Join-Path $dirRet 'Exportação PST - ex@x.com - 2026-10-09 1215'))) "-SomenteDownload: baixa e extrai na pasta com o nome do caso"
+
+# 1f) -CodigoDispositivo
+Reset-Purview
+$global:pv.Export = 1
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1f') -SomenteDownload -CodigoDispositivo 3>$null 6>$null | Out-Null
+Assert ($LASTEXITCODE -eq 0 -and $global:pv.Escopo -eq 'b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read' -and $global:pv.Token -eq 2 -and -not $global:pv.UrlLogin) "-CodigoDispositivo: login por código, aguardando a autorização"
+
+# 1g) Download falha: orienta a retomar sem exportar de novo
+Reset-Purview
+$global:pv.FalharDownload = $true
+$avisos = Get-Avisos { & $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1g') }
+Assert ($LASTEXITCODE -eq 1 -and @($avisos | Where-Object Message -match '-SomenteDownload').Count -ge 1) "download com falha: código 1 e instrução para retomar com -SomenteDownload"
+
+# 1h) Serviço de download não registrado no tenant: administrador recusa o registro
+Reset-Purview
+$global:pv.Export = 1
+$global:pv.ErroLogin = 'AADSTS650052: The app needs access to a service that your organization has not subscribed to or enabled.'
+function global:Read-Host { 'N' }
+$avisos = Get-Avisos { & $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1h') -SomenteDownload }
+Assert ($LASTEXITCODE -eq 1 -and -not $global:pv.SPRegistrado -and @($avisos | Where-Object Message -match 'Invoke-MgGraphRequest -Method POST -Uri v1.0/servicePrincipals').Count -eq 1) "serviço de download ausente e registro recusado: não altera o tenant e mostra o comando manual"
+Remove-Mocks 'Read-Host'
+
+# 1j) -RegistrarServicoDownload: registra, faz o login de novo e baixa
+Reset-Purview
+$global:pv.Export = 1
+$global:pv.ErroLogin = 'AADSTS650052: The app needs access to a service that your organization has not subscribed to or enabled.'
+$dirReg = Join-Path $tmp 'pv1j'
+& $exportar -Caixa 'ex@x.com' -Destino $dirReg -SomenteDownload -RegistrarServicoDownload 3>$null 6>$null | Out-Null
+Assert ($LASTEXITCODE -eq 0 -and $global:pv.SPBody.appId -eq 'b26e684c-5068-4120-a679-64a5d2c909d9' -and @(Get-ChildItem $dirReg -Recurse -Filter *.pst).Count -eq 1) "-RegistrarServicoDownload: registra o serviço do Purview e conclui o download"
+
+# 1i) Exportação antiga, já sem arquivos
+Reset-Purview
+$global:pv.Export = 1; $global:pv.SemArquivos = $true
+$erro = $null
+try { & $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1i') -SomenteDownload 3>$null 6>$null | Out-Null } catch { $erro = $_ }
+Assert ($erro -and "$erro" -match 'expiram' -and $global:pv.Downloads.Count -eq 0) "exportação expirada (sem arquivos): avisa em vez de baixar arquivo vazio"
+
+# 1k) -Conteudo, -De, -Ate e -Consulta viram uma consulta KQL na pesquisa
+Reset-Purview
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1k') -Conteudo Email, Calendario -De '2026-01-01' -Ate '2026-06-30' -Consulta 'from:fornecedor.com' -SemDownload 3>$null 6>$null | Out-Null
+$pesqK = @($global:pv.Chamadas | Where-Object { $_.Uri -match '/searches$' })[-1]
+Assert ($LASTEXITCODE -eq 0 -and $pesqK.Body.contentQuery -eq '(kind:email OR kind:meetings) AND received>=2026-01-01 AND received<=2026-06-30 AND (from:fornecedor.com)') "-Conteudo/-De/-Ate/-Consulta: monta a consulta KQL da pesquisa"
+Assert ($pesqK.Body.displayName -eq 'Seleção: Email, Calendario - ex@x.com')                    "pesquisa identifica a seleção no nome"
+Assert ((Get-Chamada '/exportResult$').Body.exportCriteria -eq 'searchHits')                    "com filtro: não inclui itens não indexados (não dá para saber se correspondem)"
+
+# 1l) -Conteudo Teams com -IncluirNaoIndexados
+Reset-Purview
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1l') -Conteudo Teams -IncluirNaoIndexados -SemDownload 3>$null 6>$null | Out-Null
+Assert ((Get-Chamada '/searches$').Body.contentQuery -eq '(kind:microsoftteams)' -and (Get-Chamada '/exportResult$').Body.exportCriteria -match 'partiallyIndexed') "-Conteudo Teams + -IncluirNaoIndexados"
+
+# 1m) Período invertido
+Reset-Purview
+$erro = $null
+try { & $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv1m') -De '2026-07-01' -Ate '2026-01-01' 3>$null 6>$null | Out-Null } catch { $erro = $_ }
+Assert ($erro -and "$erro" -match 'posterior' -and -not (Get-Chamada 'ediscoveryCases$'))     "-De depois de -Ate: erro antes de criar qualquer coisa no Purview"
+
+# 2) -SemDownload
+Reset-Purview
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv2') -SemDownload 3>$null 6>$null | Out-Null
+Assert ($LASTEXITCODE -eq 0 -and $global:pv.Downloads.Count -eq 0 -and $global:pv.Token -eq 0) "-SemDownload: prepara a exportação e não baixa"
+
+# 3) Tenant sem pay-as-you-go
+Reset-Purview
+$global:pv.FalharExport = $true
+$avisos = Get-Avisos { & $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv3') }
+Assert ($LASTEXITCODE -eq 1 -and @($avisos | Where-Object Message -match 'pay-as-you-go').Count -ge 1 -and @($avisos | Where-Object Message -match 'Alternativa manual').Count -eq 1) "sem pay-as-you-go: explica o que ativar e o caminho manual pelo portal"
+
+# 4) Pesquisa vazia
+Reset-Purview
+$global:pv.Itens = 0
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv4') 3>$null 6>$null | Out-Null
+Assert ($LASTEXITCODE -eq 1 -and -not (Get-Chamada '/exportResult$'))    "pesquisa sem resultados: não exporta"
+
+# 5) Exportação falha no Purview
+Reset-Purview
+$global:pv.StatusExport = 'failed'
+& $exportar -Caixa 'ex@x.com' -Destino (Join-Path $tmp 'pv5') 3>$null 6>$null | Out-Null
+Assert ($LASTEXITCODE -eq 1 -and $global:pv.Downloads.Count -eq 0)       "exportação com falha: código de saída 1, sem download"
+
+Remove-Mocks 'Get-MgContext','Connect-MgGraph','Import-Module','Install-Module','Start-Sleep','Invoke-MgGraphRequest','Invoke-RestMethod','Invoke-WebRequest','Start-Process'
+
+
 # ==============================================================================
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 $cor = if ($script:falhas) { 'Red' } else { 'Green' }
