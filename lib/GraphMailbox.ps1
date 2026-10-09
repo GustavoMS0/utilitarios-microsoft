@@ -77,6 +77,10 @@ function Invoke-GraphRetry {
 
 function ConvertTo-UrlId([string]$Id) { [uri]::EscapeDataString($Id) }
 
+# IDs do Exchange diferenciam maiúsculas/minúsculas ("...AbC" e "...aBc" são itens diferentes),
+# mas @{} do PowerShell não. Toda tabela indexada por ID deve ser criada com esta função.
+function New-TabelaPorId { [hashtable]::new([StringComparer]::Ordinal) }
+
 # Id da caixa (MBX:...) usado pelas APIs /admin/exchange/mailboxes
 function Get-MailboxId([string]$Upn) {
     $r = Invoke-GraphRetry -Uri "v1.0/users/$([uri]::EscapeDataString($Upn))/settings/exchange"
@@ -143,7 +147,7 @@ function Get-ExpandMetadados {
 
 # Metadados de até 20 itens por chamada ($batch). Falhas não interrompem o backup.
 function Get-ItemMetadata([string]$MailboxId, [string]$FolderId, [string[]]$ItemIds) {
-    $resultado = @{}
+    $resultado = New-TabelaPorId
     $expand = Get-ExpandMetadados
     for ($i = 0; $i -lt $ItemIds.Count; $i += 20) {
         $lote = @($ItemIds[$i..([math]::Min($i + 19, $ItemIds.Count - 1))])
@@ -168,7 +172,7 @@ function Get-ItemMetadata([string]$MailboxId, [string]$FolderId, [string[]]$Item
 
 # Índice: um CSV por caixa, sempre com ';' para abrir direto no Excel em pt-BR
 function Import-Indice([string]$Caminho) {
-    $indice = @{}
+    $indice = New-TabelaPorId
     if (Test-Path $Caminho) {
         foreach ($l in Import-Csv $Caminho -Delimiter ';' -Encoding UTF8) { $indice[$l.Id] = $l }
     }

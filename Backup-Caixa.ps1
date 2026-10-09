@@ -47,6 +47,9 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\GraphMailbox.ps1')
 
+# Versão do formato do estado.json; estados mais antigos forçam uma varredura completa
+$script:VersaoEstado = 2
+
 $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 $dirLog = Join-Path $Destino 'logs'
 New-Item -ItemType Directory $dirLog -Force | Out-Null
@@ -76,7 +79,7 @@ function Add-Falha([string]$ItemId, [string]$Pasta, [string]$Mensagem) {
 
 # Exporta até 20 itens numa chamada e grava os arquivos + entradas do índice
 function Export-Lote($Itens, $Pasta, $Meta) {
-    $porId = @{}
+    $porId = New-TabelaPorId
     foreach ($i in $Itens) { $porId[$i.id] = $i }
 
     try {
@@ -160,17 +163,21 @@ function Sync-Pasta($Pasta) {
     # Apagados na origem: mantém no backup e registra quando sumiram
     foreach ($id in $removidos) {
         $e = $script:indice[$id]
-        if ($e -and $e.PastaId -eq $Pasta.Id -and -not $e.RemovidoEm) {
+        if ($e -and $e.PastaId -ceq $Pasta.Id -and -not $e.RemovidoEm) {
             $e.RemovidoEm = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
             $script:stats.Removidos++
         }
     }
 
+    # O delta pode devolver o mesmo item mais de uma vez: fica só a última versão
+    $unicos = New-TabelaPorId
+    foreach ($it in $alterados) { $unicos[$it.id] = $it }
+
     # Só exporta o que é novo ou mudou de versão (ChangeKey)
     $exportar = New-Object System.Collections.Generic.List[object]
-    foreach ($it in $alterados) {
+    foreach ($it in $unicos.Values) {
         $e = $script:indice[$it.id]
-        if ($e -and $e.ChangeKey -eq $it.changeKey -and (Test-Path (Join-Path $script:dirCaixa $e.Arquivo))) {
+        if ($e -and $e.ChangeKey -ceq $it.changeKey -and (Test-Path (Join-Path $script:dirCaixa $e.Arquivo))) {
             $e.PastaId = $Pasta.Id; $e.Pasta = $Pasta.Caminho; $e.TipoPasta = $Pasta.Tipo; $e.RemovidoEm = ''
         } else {
             $exportar.Add($it)
@@ -198,10 +205,12 @@ function Sync-Pasta($Pasta) {
 
 function Save-Estado {
     @{
+        Versao       = $script:VersaoEstado
         Caixa        = $script:caixa
         MailboxId    = $script:mbx
         UltimoBackup = Get-Date -Format 's'
-        Deltas       = $script:deltas
+        # Lista (e não objeto JSON) porque nomes de propriedade JSON->PowerShell ignoram maiúsculas
+        Deltas       = @($script:deltas.Keys | ForEach-Object { @{ PastaId = $_; Link = $script:deltas[$_] } })
     } | ConvertTo-Json -Depth 5 | Set-Content $script:arqEstado -Encoding UTF8
     Export-Indice $script:indice $script:arqIndice
 }
@@ -228,14 +237,20 @@ try {
 
             $script:mbx    = Get-MailboxId $script:caixa
             $script:indice = Import-Indice $script:arqIndice
-            $script:deltas = @{}
+            $script:deltas = New-TabelaPorId
+            $modo = 'completo (primeira execução)'
             if (Test-Path $script:arqEstado) {
                 $estado = Get-Content $script:arqEstado -Raw | ConvertFrom-Json
-                if ($estado.MailboxId -eq $script:mbx -and $estado.Deltas) {
-                    foreach ($p in $estado.Deltas.PSObject.Properties) { $script:deltas[$p.Name] = $p.Value }
+                if ($estado.MailboxId -ceq $script:mbx -and $estado.Versao -ge $script:VersaoEstado) {
+                    foreach ($d in @($estado.Deltas)) { if ($d.PastaId) { $script:deltas[$d.PastaId] = $d.Link } }
+                    $modo = 'incremental'
+                } else {
+                    # Backups da versão 1 podiam perder entradas do índice (IDs comparados sem
+                    # diferenciar maiúsculas). Uma varredura completa recoloca o que falta; o que
+                    # já está certo no índice não é exportado de novo.
+                    $modo = 'completo (reparando o índice de uma versão anterior)'
                 }
             }
-            $modo = if ($script:deltas.Count -gt 0) { 'incremental' } else { 'completo (primeira execução)' }
 
             $pastas = @(Get-MailboxFolders $script:mbx | Where-Object {
                 $pasta = $_
@@ -254,7 +269,7 @@ try {
             }
 
             # Pastas que deixaram de existir: seus itens foram apagados na origem
-            $idsPastas = @{}
+            $idsPastas = New-TabelaPorId
             foreach ($p in $pastas) { $idsPastas[$p.Id] = $true }
             foreach ($e in $script:indice.Values) {
                 if (-not $idsPastas[$e.PastaId] -and -not $e.RemovidoEm -and

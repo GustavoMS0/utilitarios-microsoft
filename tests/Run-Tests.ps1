@@ -278,7 +278,7 @@ $global:mbx = @{
         @{ id = 'F2'; displayName = 'Clientes'; type = 'IPF.Note';        pai = 'F1' }
         @{ id = 'F3'; displayName = 'Calendar'; type = 'IPF.Appointment'; pai = $null }
     )
-    Itens   = @{}
+    Itens   = [hashtable]::new([StringComparer]::Ordinal)   # IDs do Exchange diferenciam maiúsculas
     Delta   = @{}
     Exports = New-Object System.Collections.Generic.List[object]
     Criadas = New-Object System.Collections.Generic.List[object]
@@ -289,12 +289,15 @@ $m2   = New-FakeItem 'm2' 'ck1' 'IPM.Note' '2026-09-20T12:00:00Z' 'Reunião' 'Fu
 $m3   = New-FakeItem 'm3' 'ck1' 'IPM.Note' '2026-08-01T12:00:00Z' 'Contrato cliente X' 'Cliente X' '2026-08-01T12:00:00Z' 'false'
 $mBig = New-FakeItem 'mBig' 'ck1' 'IPM.Note' '2026-08-02T12:00:00Z' 'Arquivo enorme' 'Cliente X' '2026-08-02T12:00:00Z' 'true' 50MB
 $c1   = New-FakeItem 'c1' 'ck1' 'IPM.Appointment' '2026-07-01T10:00:00Z' $null $null $null $null
+# IDs que só diferem em maiúsculas/minúsculas (aconteceu na caixa real: 2.157 de 9.812 itens)
+$caso1 = New-FakeItem 'AAMkCaso1' 'ck1' 'IPM.Note' '2026-09-11T12:00:00Z' 'Caso maiúsculo' 'Sistema' '2026-09-11T12:00:00Z' 'false'
+$caso2 = New-FakeItem 'aamKcASO1' 'ck1' 'IPM.Note' '2026-09-11T12:00:00Z' 'Caso minúsculo' 'Sistema' '2026-09-11T12:00:00Z' 'false'
 
 # Execução 1: varredura completa, Inbox em 2 páginas
 $global:mbx.Delta = @{
     'init-F1' = @{ value = @($m1); '@odata.nextLink' = 'p2-F1' }
-    'p2-F1'   = @{ value = @($m2); '@odata.deltaLink' = 'd1-F1' }
-    'init-F2' = @{ value = @($m3, $mBig); '@odata.deltaLink' = 'd1-F2' }
+    'p2-F1'   = @{ value = @($m2, $caso1, $caso2); '@odata.deltaLink' = 'd1-F1' }
+    'init-F2' = @{ value = @($m3, $mBig, $m3); '@odata.deltaLink' = 'd1-F2' }   # m3 repetido no delta
     'init-F3' = @{ value = @($c1); '@odata.deltaLink' = 'd1-F3' }
 }
 
@@ -357,15 +360,27 @@ function global:Invoke-MgGraphRequest { param($Method = 'GET', $Uri, $Body, $Hea
     throw "Rota não simulada: $Method $Uri"
 }
 
+
 $bkp = Join-Path $tmp 'bkp'
 $cx  = Join-Path $bkp 'fin@x.com'
-& (Join-Path $raiz 'Backup-Caixa.ps1') -Caixas 'Fin@X.com' -Destino $bkp 3>$null 6>$null | Out-Null
-$exit1  = $LASTEXITCODE
-$indice = @{}; Import-Csv (Join-Path $cx 'indice.csv') -Delimiter ';' | ForEach-Object { $indice[$_.Id] = $_ }
-$estado = Get-Content (Join-Path $cx 'estado.json') -Raw | ConvertFrom-Json
+function Get-Indice {
+    $t = [hashtable]::new([StringComparer]::Ordinal)
+    Import-Csv (Join-Path $cx 'indice.csv') -Delimiter ';' | ForEach-Object { $t[$_.Id] = $_ }
+    $t
+}
+function Get-Delta($PastaId) { (@((Get-Content (Join-Path $cx 'estado.json') -Raw | ConvertFrom-Json).Deltas) | Where-Object { $_.PastaId -ceq $PastaId }).Link }
 function Get-Conteudo($Id) { [IO.File]::ReadAllText((Join-Path $cx $indice[$Id].Arquivo)) }
 
-Assert ($indice.Count -eq 4)                                           "1ª execução: 4 itens no índice (o que falhou fica de fora)"
+& (Join-Path $raiz 'Backup-Caixa.ps1') -Caixas 'Fin@X.com' -Destino $bkp 3>$null 6>$null | Out-Null
+$exit1      = $LASTEXITCODE
+$indice     = Get-Indice
+$exportados = @($global:mbx.Exports | ForEach-Object { $_ })
+
+Assert ($indice.Count -eq 6)                                           "1ª execução: 6 itens no índice (o que falhou fica de fora)"
+Assert ($indice.ContainsKey('AAMkCaso1') -and $indice.ContainsKey('aamKcASO1')) "IDs que só diferem em maiúsculas/minúsculas são itens distintos no índice"
+Assert ($indice['AAMkCaso1'].Assunto -eq 'Caso maiúsculo' -and $indice['aamKcASO1'].Assunto -eq 'Caso minúsculo') "...e cada um mantém seus próprios metadados"
+Assert ((Get-Conteudo 'aamKcASO1') -eq 'FTS:aamKcASO1:ck1')            "...e aponta para o próprio arquivo"
+Assert (@($exportados | Where-Object { $_ -ceq 'm3' }).Count -eq 1)    "item repetido no delta é exportado uma vez só"
 Assert ((Get-Conteudo 'm1') -eq 'FTS:m1:ck1')                          "grava o conteúdo exportado (.fts)"
 Assert ($indice['m1'].Arquivo -like 'itens\2026\09\*.fts')             "organiza os arquivos por ano/mês"
 Assert ($indice['m1'].Assunto -eq 'Boleto setembro' -and $indice['m1'].Remetente -eq 'Fornecedor A' -and $indice['m1'].Anexo -eq 'Sim') "índice com assunto, remetente e anexo (ids MAPI normalizados)"
@@ -376,7 +391,7 @@ Assert ($indice.ContainsKey('m2'))                                     "segue a 
 Assert (@($global:mbx.Exports | Where-Object { $_ -contains 'mBig' -and $_.Count -eq 1 }).Count -eq 1) "item grande é exportado num lote separado"
 Assert ((Get-Content (Join-Path $cx 'falhas.log') -Raw) -match 'mBig.*ItemTooLarge') "registra falhas em falhas.log"
 Assert ($exit1 -eq 1)                                                  "código de saída 1 quando há falhas (para o agendador)"
-Assert ($estado.Deltas.F1 -eq 'd1-F1' -and $estado.Deltas.F3 -eq 'd1-F3') "salva os tokens de sincronização"
+Assert ((Get-Delta 'F1') -eq 'd1-F1' -and (Get-Delta 'F3') -eq 'd1-F3') "salva os tokens de sincronização"
 Assert ((Get-ChildItem (Join-Path $bkp 'logs') -Filter 'backup-*.log').Count -ge 1) "gera log da execução"
 
 # Execução 2: incremental (m2 apagado, m1 alterado, m4 novo, token do Calendar expirado)
@@ -390,15 +405,33 @@ $global:mbx.Delta = @{
 }
 $global:mbx.Exports.Clear()
 & (Join-Path $raiz 'Backup-Caixa.ps1') -Caixas 'fin@x.com' -Destino $bkp 3>$null 6>$null | Out-Null
-$indice = @{}; Import-Csv (Join-Path $cx 'indice.csv') -Delimiter ';' | ForEach-Object { $indice[$_.Id] = $_ }
-$estado = Get-Content (Join-Path $cx 'estado.json') -Raw | ConvertFrom-Json
+$indice     = Get-Indice
 $exportados = @($global:mbx.Exports | ForEach-Object { $_ })
 
-Assert ($indice.Count -eq 5)                                            "2ª execução: item novo entra no índice"
+Assert ($indice.Count -eq 7)                                            "2ª execução: item novo entra no índice"
 Assert ($indice['m2'].RemovidoEm -and (Test-Path (Join-Path $cx $indice['m2'].Arquivo))) "item apagado na origem fica no backup, marcado com RemovidoEm"
 Assert ((Get-Conteudo 'm1') -eq 'FTS:m1:ck2')                           "item alterado (novo ChangeKey) é exportado de novo"
 Assert ($exportados -notcontains 'c1' -and $exportados -notcontains 'm3') "itens sem mudança não são exportados de novo"
-Assert ($estado.Deltas.F3 -eq 'd2-F3')                                  "token expirado (410): refaz a varredura da pasta"
+Assert ((Get-Delta 'F3') -eq 'd2-F3')                                   "token expirado (410): refaz a varredura da pasta"
+
+# Execução 3: backup feito pela versão 1 (estado sem versão, índice com entradas perdidas)
+$linhas = Import-Csv (Join-Path $cx 'indice.csv') -Delimiter ';'
+$linhas | Where-Object { $_.Id -cnotin 'm3', 'AAMkCaso1' } | Export-Csv (Join-Path $cx 'indice.csv') -Delimiter ';' -NoTypeInformation -Encoding UTF8
+@{ Caixa = 'fin@x.com'; MailboxId = 'MBX:1@2'; Deltas = @{ F1 = 'd2-F1'; F2 = 'd2-F2'; F3 = 'd2-F3' } } |
+    ConvertTo-Json | Set-Content (Join-Path $cx 'estado.json') -Encoding UTF8
+$global:mbx.Delta = @{
+    'init-F1' = @{ value = @($m1v2, $m4, $caso1, $caso2); '@odata.deltaLink' = 'd3-F1' }
+    'init-F2' = @{ value = @($m3, $mBig); '@odata.deltaLink' = 'd3-F2' }
+    'init-F3' = @{ value = @($c1); '@odata.deltaLink' = 'd3-F3' }
+}
+$global:mbx.Exports.Clear()
+& (Join-Path $raiz 'Backup-Caixa.ps1') -Caixas 'fin@x.com' -Destino $bkp 3>$null 6>$null | Out-Null
+$indice     = Get-Indice
+$exportados = @($global:mbx.Exports | ForEach-Object { $_ } | Sort-Object)
+
+Assert ($indice.ContainsKey('m3') -and $indice.ContainsKey('AAMkCaso1') -and $indice.Count -eq 7) "estado da versão 1: varredura completa recoloca no índice o que faltava"
+Assert (($exportados -join ',') -ceq 'AAMkCaso1,m3,mBig')               "...exportando só os itens ausentes (o resto não é baixado de novo)"
+Assert ((Get-Delta 'F1') -eq 'd3-F1')                                   "...e grava o estado no formato novo"
 
 
 # ==============================================================================
@@ -427,7 +460,7 @@ Assert (@($global:mbx.Criadas | Where-Object displayName -eq 'Restaurados teste'
 
 $global:imports.Clear()
 & $restaurar -Caixa 'fin@x.com' -Destino $bkp -De '2026-09-01' -Ate '2026-09-30' -PastaRestauracao 'Restaurados teste' -Todos -Force 3>$null 6>$null | Out-Null
-Assert ($global:imports.Count -eq 2)                                   "filtro por período (-De/-Ate) traz os 2 itens de setembro"
+Assert ($global:imports.Count -eq 4)                                   "filtro por período (-De/-Ate) traz os 4 itens de setembro"
 
 $global:imports.Clear()
 & $restaurar -Caixa 'fin@x.com' -Destino $bkp -Assunto 'nao-existe' -Todos -Force 3>$null 6>$null | Out-Null

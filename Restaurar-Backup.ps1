@@ -101,7 +101,7 @@ if ($Todos) {
 } elseif ($GridView -and (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
     $selecionados = @($itens | Select-Object Data, Pasta, Assunto, Remetente, Email, Anexo, TamanhoKB, RemovidoEm, Id |
         Out-GridView -Title "Selecione os itens para restaurar (Ctrl+clique para vários)" -PassThru |
-        ForEach-Object { $id = $_.Id; $itens | Where-Object Id -eq $id })
+        ForEach-Object { $id = $_.Id; $itens | Where-Object { $_.Id -ceq $id } })
 } else {
     $max = [math]::Min($itens.Count, 200)
     for ($i = 0; $i -lt $max; $i++) {
