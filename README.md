@@ -2,6 +2,16 @@
 
 Scripts PowerShell para administração e auditoria de **Entra ID**, **Exchange Online** e **SharePoint Online**.
 
+## Início rápido
+
+```powershell
+.\Menu.ps1
+```
+
+O menu reúne todos os utilitários por assunto. Ao escolher um, ele pergunta só o necessário (caixa, período, o que
+exportar…), **mostra o comando equivalente** e pede confirmação antes de executar. O comando mostrado pode ser copiado
+para rodar direto depois ou para agendar. Cada script também funciona sozinho, como descrito abaixo.
+
 | Script | Para que serve | Conecta em |
 |---|---|---|
 | [NewClone.ps1](NewClone.ps1) | Cria um usuário clonando grupos, licenças e listas de distribuição de um usuário modelo | Graph + Exchange Online |

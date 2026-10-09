@@ -771,6 +771,84 @@ Assert ($LASTEXITCODE -eq 1 -and $global:pv.Downloads.Count -eq 0)       "export
 Remove-Mocks 'Get-MgContext','Connect-MgGraph','Import-Module','Install-Module','Start-Sleep','Invoke-MgGraphRequest','Invoke-RestMethod','Invoke-WebRequest','Start-Process'
 
 
+
+
+# ==============================================================================
+Write-Host "`n== Menu.ps1 ==" -ForegroundColor Cyan
+# ==============================================================================
+# Scripts falsos com os MESMOS parâmetros dos reais: registram a chamada em vez de executar
+$dirFalsos = Join-Path $tmp 'menu-scripts'
+New-Item -ItemType Directory $dirFalsos -Force | Out-Null
+foreach ($s in Get-ChildItem $raiz -Filter *.ps1 | Where-Object Name -ne 'Menu.ps1') {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($s.FullName, [ref]$null, [ref]$null)
+    $params = @($(if ($ast.ParamBlock) { $ast.ParamBlock.Parameters }) | ForEach-Object {
+        $tipo = if ($_.StaticType -eq [switch]) { '[switch]' } else { '' }
+        "$tipo`$$($_.Name.VariablePath.UserPath)"
+    })
+    @"
+param($($params -join ', '))
+`$global:menuChamadas.Add([pscustomobject]@{ Script = '$($s.Name)'; Params = [hashtable]::new(`$PSBoundParameters) })
+if (`$global:menuFalhar) { throw 'falha simulada' }
+exit 0
+"@ | Set-Content (Join-Path $dirFalsos $s.Name) -Encoding UTF8
+}
+
+function global:Read-Host { param($Prompt) if ($global:respostas.Count -eq 0) { throw "Sem resposta para: $Prompt" }; $global:respostas.Dequeue() }
+function Invoke-Menu([string[]]$Respostas) {
+    $global:respostas    = [System.Collections.Generic.Queue[string]]::new([string[]]$Respostas)
+    $global:menuChamadas = [System.Collections.Generic.List[object]]::new()
+    & (Join-Path $raiz 'Menu.ps1') -PastaScripts $dirFalsos 6>&1 | Out-String
+}
+$menuItens = @{ NewClone = '1'; Sharepoint = '2'; Auditoria = '3'; Extracao = '4'; Recuperar = '5'; Backup = '6'; Restaurar = '7'; PST = '8'; App = '9' }
+
+# 1) Exportar PST com seleção de conteúdo e período (e um e-mail inválido no meio)
+$saida = Invoke-Menu @($menuItens.PST, 'abc', 'ex@x.com', 'N', '1,2', '2026-01-01', '', '', '', '', '0')
+$c = $global:menuChamadas[0]
+Assert ($global:menuChamadas.Count -eq 1 -and $c.Script -eq 'Exportar-PST.ps1')                     "menu: chama o script escolhido"
+Assert ($c.Params.Caixa -eq 'ex@x.com' -and $saida -match 'Resposta inválida')                     "menu: rejeita e-mail inválido e pergunta de novo"
+Assert ((@($c.Params.Conteudo) -join ',') -eq 'Email,Calendario' -and $c.Params.De -eq [datetime]'2026-01-01') "menu: escolha múltipla e data viram parâmetros"
+Assert (-not $c.Params.ContainsKey('Ate') -and -not $c.Params.ContainsKey('Destino') -and -not $c.Params.ContainsKey('SomenteDownload')) "menu: respostas em branco usam o padrão do script"
+Assert ($saida -match [regex]::Escape(".\Exportar-PST.ps1 -Caixa ex@x.com -Conteudo Email, Calendario -De 2026-01-01")) "menu: mostra o comando equivalente"
+
+# 2) PST só download: não pergunta conteúdo nem período
+$saida = Invoke-Menu @($menuItens.PST, 'ex@x.com', 'S', '', '', '', '0')
+$c = $global:menuChamadas[0]
+Assert ($c.Params.SomenteDownload -and -not $c.Params.ContainsKey('Conteudo') -and -not $c.Params.ContainsKey('De')) "menu: -SomenteDownload pula as perguntas de conteúdo e período"
+
+# 3) Lista de caixas (vírgula, ponto e vírgula ou espaço)
+$saida = Invoke-Menu @($menuItens.Auditoria, 'a@x.com; b@x.com', '', '', '0')
+Assert ((@($global:menuChamadas[0].Params.Caixas) -join ',') -eq 'a@x.com,b@x.com')                   "menu: lista de caixas vira array"
+
+# 4) Cancelar na confirmação
+$saida = Invoke-Menu @($menuItens.Backup, 'a@x.com', '', 'N', '0')
+Assert ($global:menuChamadas.Count -eq 0)                                                          "menu: 'N' na confirmação não executa"
+
+# 5) Erro no script: mostra e volta ao menu
+$global:menuFalhar = $true
+$saida = Invoke-Menu @($menuItens.NewClone, '', '', '0')
+$global:menuFalhar = $false
+Assert ($saida -match 'Erro: falha simulada' -and $global:respostas.Count -eq 0)                    "menu: erro no script é mostrado e o menu continua"
+
+# 6) Opção inválida e todos os itens apontando para scripts que existem
+$saida = Invoke-Menu @('99', 'x', '0')
+Assert ($global:respostas.Count -eq 0)                                                             "menu: ignora opção inválida"
+$menuAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $raiz 'Menu.ps1'), [ref]$null, [ref]$null)
+$scriptsMenu = @($menuAst.FindAll({ $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $args[0].Value -like '*.ps1' }, $true) | ForEach-Object Value | Select-Object -Unique)
+Assert (-not ($scriptsMenu | Where-Object { -not (Test-Path (Join-Path $raiz $_)) }) -and $scriptsMenu.Count -eq 9) "menu: os 9 itens apontam para scripts existentes"
+
+# 7) Cada pergunta do menu corresponde a um parâmetro real do script
+$problemas = foreach ($s in $scriptsMenu) {
+    $real = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $raiz $s), [ref]$null, [ref]$null)
+    $nomes = @($real.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    $bloco = $menuAst.FindAll({ $args[0] -is [System.Management.Automation.Language.HashtableAst] -and $args[0].Extent.Text -match "Script = '$([regex]::Escape($s))'" }, $true) | Select-Object -First 1
+    foreach ($m in [regex]::Matches($bloco.Extent.Text, "Nome = '(\w+)'")) {
+        if ($nomes -notcontains $m.Groups[1].Value) { "$s -$($m.Groups[1].Value)" }
+    }
+}
+Assert (@($problemas).Count -eq 0)                                                                 "menu: toda pergunta vira um parâmetro que existe no script ($(@($problemas) -join ', '))"
+
+Remove-Mocks 'Read-Host'
+
 # ==============================================================================
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 $cor = if ($script:falhas) { 'Red' } else { 'Green' }
