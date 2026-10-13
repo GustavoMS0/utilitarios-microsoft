@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Menu interativo com todos os utilitários deste repositório.
 
@@ -173,12 +173,22 @@ function Invoke-Item($Item) {
 }
 
 
+function Show-Banner {
+    Write-Host " ╔═════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host " ║          MICROSOFT 365 & CLOUD ADMIN TOOLKIT                ║" -ForegroundColor Cyan
+    Write-Host " ║    Auditoria, Backup, Governança & Gestão de Identidades    ║" -ForegroundColor DarkGray
+    Write-Host " ╠═════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host " ║  Autor:    Gustavo Martins (@GustavoMS0)                    ║" -ForegroundColor White
+    Write-Host " ║  Projeto:  https://github.com/GustavoMS0/utilitarios-microsoft║" -ForegroundColor DarkGray
+    Write-Host " ╚═════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+}
+
 # ==============================================================================
 # MENU
 # ==============================================================================
 while ($true) {
     try { Clear-Host } catch {}
-    Write-Host "Utilitários Microsoft 365" -ForegroundColor Cyan
+    Show-Banner
     $grupo = $null
     for ($i = 0; $i -lt $itens.Count; $i++) {
         if ($itens[$i].Grupo -ne $grupo) { $grupo = $itens[$i].Grupo; Write-Host "`n $grupo" -ForegroundColor Yellow }
