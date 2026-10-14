@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Menu interativo com todos os utilitários deste repositório.
 
@@ -10,6 +10,8 @@
 .EXAMPLE
   .\Menu.ps1
 #>
+#Requires -Version 5.1
+[CmdletBinding()]
 param(
     # Pasta dos scripts (usado pelos testes)
     [string]$PastaScripts = $PSScriptRoot
@@ -144,7 +146,7 @@ function Format-Comando([string]$Script, [System.Collections.Specialized.Ordered
     $partes -join ' '
 }
 
-function Invoke-Item($Item) {
+function Invoke-Utilitario($Item) {
     Write-Host "`n=== $($Item.Titulo) ===" -ForegroundColor Cyan
     $params = [ordered]@{}
     foreach ($p in $Item.Perguntas) {
@@ -174,20 +176,20 @@ function Invoke-Item($Item) {
 
 
 function Show-Banner {
-    Write-Host " ╔═════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host " ║          MICROSOFT 365 & CLOUD ADMIN TOOLKIT                ║" -ForegroundColor Cyan
-    Write-Host " ║    Auditoria, Backup, Governança & Gestão de Identidades    ║" -ForegroundColor DarkGray
-    Write-Host " ╠═════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
-    Write-Host " ║  Autor:    Gustavo Martins (@GustavoMS0)                    ║" -ForegroundColor White
-    Write-Host " ║  Projeto:  https://github.com/GustavoMS0/utilitarios-microsoft║" -ForegroundColor DarkGray
-    Write-Host " ╚═════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host " ╔═════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host " ║               MICROSOFT 365 & CLOUD ADMIN TOOLKIT               ║" -ForegroundColor Cyan
+    Write-Host " ║      Auditoria, Backup, Governança & Gestão de Identidades      ║" -ForegroundColor DarkGray
+    Write-Host " ╠═════════════════════════════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host " ║  Autor:    Gustavo Martins (@GustavoMS0)                        ║" -ForegroundColor White
+    Write-Host " ║  Projeto:  https://github.com/GustavoMS0/utilitarios-microsoft  ║" -ForegroundColor DarkGray
+    Write-Host " ╚═════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 }
 
 # ==============================================================================
 # MENU
 # ==============================================================================
 while ($true) {
-    try { Clear-Host } catch {}
+    try { Clear-Host } catch { Write-Verbose "Console sem suporte a Clear-Host: $($_.Exception.Message)" }
     Show-Banner
     $grupo = $null
     for ($i = 0; $i -lt $itens.Count; $i++) {
@@ -198,6 +200,6 @@ while ($true) {
     $op = (Read-Host "`nEscolha").Trim()
     if ($op -eq '0') { break }
     if ($op -match '^\d+$' -and [int]$op -ge 1 -and [int]$op -le $itens.Count) {
-        Invoke-Item $itens[[int]$op - 1]
+        Invoke-Utilitario $itens[[int]$op - 1]
     }
 }

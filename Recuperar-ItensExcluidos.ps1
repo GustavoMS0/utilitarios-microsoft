@@ -23,7 +23,13 @@
 .EXAMPLE
   # E-mails apagados nos últimos 3 dias, todos de volta numa pasta separada
   .\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Tipo IPM.Note -De (Get-Date).AddDays(-3) -Todos -PastaDestino "Recuperados"
+
+.EXAMPLE
+  # Só mostra o que seria restaurado, sem alterar a caixa
+  .\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto -Todos -WhatIf
 #>
+#Requires -Version 5.1
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [Parameter(Mandatory = $true, HelpMessage = "E-mail da caixa (ex: financeiro@empresa.com.br)")]
     [ValidateNotNullOrEmpty()]
@@ -56,124 +62,120 @@ param(
     # Não pede confirmação
     [switch]$Force,
 
-    [string]$Relatorio = "C:\Temp\Recuperacao-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    # Se a pasta for criada pelo script, só o usuário atual, SYSTEM e Administradores têm acesso
+    [string]$Relatorio = "C:\Temp\Recuperacao\Recuperacao-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib\Common.ps1')
 
 # ==============================================================================
 # PASSO 0: CONEXÃO E PERMISSÃO
 # ==============================================================================
-if (-not (Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue)) {
-    Write-Host "Instalando módulo: ExchangeOnlineManagement ..." -ForegroundColor Yellow
-    Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -Repository PSGallery
-}
-if (-not (Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object State -eq 'Connected')) {
-    Connect-ExchangeOnline -ShowBanner:$false
-}
+Connect-ExchangeSeNecessario
 
-# Sem a função Mailbox Import Export os cmdlets nem aparecem na sessão
-if (-not (Get-Command Get-RecoverableItems -ErrorAction SilentlyContinue)) {
-    Write-Warning "Get-RecoverableItems não está disponível: sua conta não tem a função 'Mailbox Import Export'."
-    Write-Warning "Peça a um administrador do Exchange para rodar:"
-    Write-Warning "  New-ManagementRoleAssignment -Role 'Mailbox Import Export' -User <sua conta>"
-    Write-Warning "Depois desconecte (Disconnect-ExchangeOnline) e rode este script de novo."
-    exit 1
-}
-
-
-# ==============================================================================
-# PASSO 1: BUSCA
-# ==============================================================================
-$filtros = @{ Identity = $Caixa; ResultSize = $Max }
-if ($Assunto) { $filtros.SubjectContains = $Assunto }
-if ($Tipo)    { $filtros.FilterItemType  = $Tipo }
-if ($Origem)  { $filtros.SourceFolder    = $Origem }
-if ($PSBoundParameters.ContainsKey('De'))  { $filtros.FilterStartTime = $De }
-if ($PSBoundParameters.ContainsKey('Ate')) { $filtros.FilterEndTime   = $Ate.Date.AddDays(1).AddTicks(-1) }
-
-Write-Host "Buscando itens excluídos em $Caixa..." -ForegroundColor Cyan
-$itens = @(Get-RecoverableItems @filtros | Sort-Object LastModifiedTime -Descending)
-
-if ($itens.Count -eq 0) {
-    Write-Host "Nenhum item excluído encontrado com esses filtros." -ForegroundColor Yellow
-    return
-}
-if ($itens.Count -ge $Max) { Write-Warning "Atingido o limite de $Max itens. Refine os filtros ou aumente -Max." }
-
-$origens = @{
-    DeletedItems        = 'Itens Excluídos'
-    RecoverableItems    = 'Recuperáveis'
-    PurgedItems         = 'Expurgados'
-    DiscoveryHoldsItems = 'Retidos (Hold)'
-}
-
-
-# ==============================================================================
-# PASSO 2: SELEÇÃO
-# ==============================================================================
-if ($Todos) {
-    $selecionados = $itens
-} elseif ($GridView -and (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
-    $selecionados = @($itens | Out-GridView -Title "Selecione os itens para restaurar (Ctrl+clique para vários)" -PassThru)
-} else {
-    for ($i = 0; $i -lt $itens.Count; $i++) {
-        $it = $itens[$i]
-        $local = if ($origens["$($it.SourceFolder)"]) { $origens["$($it.SourceFolder)"] } else { "$($it.SourceFolder)" }
-        Write-Host ("  [{0,3}] {1:dd/MM/yyyy HH:mm}  {2,-16} {3,-15} {4}" -f $i, $it.LastModifiedTime, $it.ItemClass, $local, $it.Subject)
-        if ($it.LastParentPath) { Write-Host ("        pasta original: {0}" -f $it.LastParentPath) -ForegroundColor DarkGray }
+try {
+    # Sem a função Mailbox Import Export os cmdlets nem aparecem na sessão
+    if (-not (Get-Command Get-RecoverableItems -ErrorAction SilentlyContinue)) {
+        Write-Warning "Get-RecoverableItems não está disponível: sua conta não tem a função 'Mailbox Import Export'."
+        Write-Warning "Peça a um administrador do Exchange para rodar:"
+        Write-Warning "  New-ManagementRoleAssignment -Role 'Mailbox Import Export' -User <sua conta>"
+        Write-Warning "Depois desconecte (Disconnect-ExchangeOnline) e rode este script de novo."
+        exit 1
     }
-    $resp = Read-Host "`nNúmeros (ex: 0,3,5-8), [T] para todos ou [Enter] para cancelar"
-    $selecionados = @()
-    if ($resp.Trim().ToUpper() -eq 'T') {
+
+
+    # ==============================================================================
+    # PASSO 1: BUSCA
+    # ==============================================================================
+    $filtros = @{ Identity = $Caixa; ResultSize = $Max }
+    if ($Assunto) { $filtros.SubjectContains = $Assunto }
+    if ($Tipo)    { $filtros.FilterItemType  = $Tipo }
+    if ($Origem)  { $filtros.SourceFolder    = $Origem }
+    if ($PSBoundParameters.ContainsKey('De'))  { $filtros.FilterStartTime = $De }
+    if ($PSBoundParameters.ContainsKey('Ate')) { $filtros.FilterEndTime   = $Ate.Date.AddDays(1).AddTicks(-1) }
+
+    Write-Host "Buscando itens excluídos em $Caixa..." -ForegroundColor Cyan
+    $itens = @(Get-RecoverableItems @filtros | Sort-Object LastModifiedTime -Descending)
+
+    if ($itens.Count -eq 0) {
+        Write-Host "Nenhum item excluído encontrado com esses filtros." -ForegroundColor Yellow
+        return
+    }
+    if ($itens.Count -ge $Max) { Write-Warning "Atingido o limite de $Max itens. Refine os filtros ou aumente -Max." }
+
+    $origens = @{
+        DeletedItems        = 'Itens Excluídos'
+        RecoverableItems    = 'Recuperáveis'
+        PurgedItems         = 'Expurgados'
+        DiscoveryHoldsItems = 'Retidos (Hold)'
+    }
+
+
+    # ==============================================================================
+    # PASSO 2: SELEÇÃO
+    # ==============================================================================
+    if ($Todos) {
         $selecionados = $itens
-    } elseif ($resp) {
-        $indices = foreach ($parte in $resp -split ',') {
-            $parte = $parte.Trim()
-            if ($parte -match '^(\d+)-(\d+)$') { [int]$Matches[1]..[int]$Matches[2] }
-            elseif ($parte -match '^\d+$')   { [int]$parte }
+    } elseif ($GridView -and (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
+        $selecionados = @($itens | Out-GridView -Title "Selecione os itens para restaurar (Ctrl+clique para vários)" -PassThru)
+    } else {
+        for ($i = 0; $i -lt $itens.Count; $i++) {
+            $it = $itens[$i]
+            $local = if ($origens["$($it.SourceFolder)"]) { $origens["$($it.SourceFolder)"] } else { "$($it.SourceFolder)" }
+            Write-Host ("  [{0,3}] {1:dd/MM/yyyy HH:mm}  {2,-16} {3,-15} {4}" -f $i, $it.LastModifiedTime, $it.ItemClass, $local, $it.Subject)
+            if ($it.LastParentPath) { Write-Host ("        pasta original: {0}" -f $it.LastParentPath) -ForegroundColor DarkGray }
         }
-        $selecionados = @($indices | Where-Object { $_ -lt $itens.Count } | Select-Object -Unique | ForEach-Object { $itens[$_] })
+        $resp = Read-Host "`nNúmeros (ex: 0,3,5-8), [T] para todos ou [Enter] para cancelar"
+        $selecionados = @()
+        if ($resp.Trim().ToUpper() -eq 'T') {
+            $selecionados = $itens
+        } elseif ($resp) {
+            $selecionados = @(ConvertFrom-Selecao $resp $itens.Count | ForEach-Object { $itens[$_] })
+        }
     }
-}
 
-if ($selecionados.Count -eq 0) { Write-Host "Nada selecionado." -ForegroundColor Yellow; return }
+    if ($selecionados.Count -eq 0) { Write-Host "Nada selecionado." -ForegroundColor Yellow; return }
 
-$alvo = if ($PastaDestino) { "pasta '$PastaDestino'" } else { 'pasta original de cada item' }
-Write-Host "`nRestaurar $($selecionados.Count) item(ns) de $Caixa para a $alvo." -ForegroundColor Yellow
-if (-not $Force -and (Read-Host "Confirmar? (S/N)").ToUpper() -ne 'S') { return }
+    $alvo = if ($PastaDestino) { "pasta '$PastaDestino'" } else { 'pasta original de cada item' }
+    Write-Host "`nRestaurar $($selecionados.Count) item(ns) de $Caixa para a $alvo." -ForegroundColor Yellow
+    if (-not $Force -and -not $WhatIfPreference -and (Read-Host "Confirmar? (S/N)").ToUpper() -ne 'S') { return }
+    if (-not $PSCmdlet.ShouldProcess($Caixa, "Restaurar $($selecionados.Count) item(ns) para a $alvo")) { return }
 
 
-# ==============================================================================
-# PASSO 3: RESTAURAÇÃO (um a um, pelo EntryID, para não trazer itens a mais)
-# ==============================================================================
-$resultado = New-Object System.Collections.Generic.List[object]
-$ok = 0
-foreach ($it in $selecionados) {
-    $status = 'OK'; $erro = ''
-    try {
-        $p = @{ Identity = $Caixa; EntryID = $it.EntryID; ErrorAction = 'Stop' }
-        if ($PastaDestino) { $p.RestoreTargetFolder = $PastaDestino }
-        $null = Restore-RecoverableItems @p
-        $ok++
-    } catch {
-        $status = 'Falha'; $erro = $_.Exception.Message
-        Write-Warning "Falha ao restaurar '$($it.Subject)': $erro"
+    # ==============================================================================
+    # PASSO 3: RESTAURAÇÃO (um a um, pelo EntryID, para não trazer itens a mais)
+    # ==============================================================================
+    $resultado = New-Object System.Collections.Generic.List[object]
+    $ok = 0
+    foreach ($it in $selecionados) {
+        $status = 'OK'; $erro = ''
+        try {
+            $p = @{ Identity = $Caixa; EntryID = $it.EntryID; ErrorAction = 'Stop' }
+            if ($PastaDestino) { $p.RestoreTargetFolder = $PastaDestino }
+            $null = Restore-RecoverableItems @p
+            $ok++
+        } catch {
+            $status = 'Falha'; $erro = $_.Exception.Message
+            Write-Warning "Falha ao restaurar '$($it.Subject)': $erro"
+        }
+        $resultado.Add([pscustomobject]@{
+            ExcluidoEm    = $it.LastModifiedTime
+            Tipo          = $it.ItemClass
+            Assunto       = $it.Subject
+            Origem        = $it.SourceFolder
+            PastaOriginal = $it.LastParentPath
+            Status        = $status
+            Erro          = $erro
+        })
     }
-    $resultado.Add([pscustomobject]@{
-        ExcluidoEm    = $it.LastModifiedTime
-        Tipo          = $it.ItemClass
-        Assunto       = $it.Subject
-        Origem        = $it.SourceFolder
-        PastaOriginal = $it.LastParentPath
-        Status        = $status
-        Erro          = $erro
-    })
+
+    New-PastaSegura (Split-Path $Relatorio)
+    $resultado | Export-Csv $Relatorio -NoTypeInformation -Encoding UTF8 -UseCulture
+
+    $cor = if ($ok -eq $selecionados.Count) { 'Green' } else { 'Yellow' }
+    Write-Host "`n$ok de $($selecionados.Count) item(ns) restaurados." -ForegroundColor $cor
+    Write-Host "Relatório: $Relatorio"
+} finally {
+    Disconnect-ExchangeSeConectado
 }
-
-New-Item -ItemType Directory (Split-Path $Relatorio) -Force | Out-Null
-$resultado | Export-Csv $Relatorio -NoTypeInformation -Encoding UTF8 -UseCulture
-
-$cor = if ($ok -eq $selecionados.Count) { 'Green' } else { 'Yellow' }
-Write-Host "`n$ok de $($selecionados.Count) item(ns) restaurados." -ForegroundColor $cor
-Write-Host "Relatório: $Relatorio"

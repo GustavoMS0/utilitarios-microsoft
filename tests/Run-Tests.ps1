@@ -23,6 +23,12 @@ function Assert($condicao, [string]$descricao) {
 # Nunca instalar nada durante os testes
 function global:Install-Module { }
 
+# Desconexões registradas em vez de executadas (os scripts só desconectam o que eles mesmos conectaram)
+$global:desconexoes = New-Object System.Collections.Generic.List[string]
+function global:Disconnect-MgGraph { $global:desconexoes.Add('Graph') }
+function global:Disconnect-ExchangeOnline { param([switch]$Confirm, $ErrorAction) $global:desconexoes.Add('Exchange') }
+function global:Disconnect-SPOService { $global:desconexoes.Add('SPO') }
+
 function Remove-Mocks([string[]]$Nomes) {
     foreach ($n in $Nomes) { Remove-Item "Function:\$n" -ErrorAction SilentlyContinue }
 }
@@ -31,10 +37,43 @@ function Remove-Mocks([string[]]$Nomes) {
 # ==============================================================================
 Write-Host "`n== Sintaxe de todos os scripts ==" -ForegroundColor Cyan
 # ==============================================================================
-foreach ($f in Get-ChildItem $raiz -Filter *.ps1) {
+$todosPs1 = @(Get-ChildItem $raiz -Filter *.ps1 -Recurse | Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' })
+foreach ($f in $todosPs1) {
     $erros = $null
     [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$erros) | Out-Null
     Assert ($erros.Count -eq 0) "$($f.Name) sem erros de sintaxe"
+}
+
+
+# ==============================================================================
+Write-Host "`n== Codificação (UTF-8 com BOM) ==" -ForegroundColor Cyan
+# ==============================================================================
+# Sem BOM o Windows PowerShell 5.1 lê o arquivo como ANSI e corrompe acentos e o desenho do menu
+$rastreados = @(git -C $raiz ls-files '*.ps1' 2>$null)
+if ($rastreados.Count -eq 0) { $rastreados = @($todosPs1 | ForEach-Object { $_.FullName.Substring($raiz.Length + 1) }) }
+foreach ($rel in $rastreados) {
+    $bytes = [IO.File]::ReadAllBytes((Join-Path $raiz $rel))
+    $bom   = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    Assert $bom "$rel começa com BOM UTF-8"
+}
+
+
+# ==============================================================================
+Write-Host "`n== lib/Common.ps1 ==" -ForegroundColor Cyan
+# ==============================================================================
+. (Join-Path $raiz 'lib\Common.ps1')
+Assert ((@(ConvertFrom-Selecao '0,3,5-8,3' 10) -join ',') -eq '0,3,5,6,7,8') "seleção: números, intervalos e repetidos"
+Assert ((@(ConvertFrom-Selecao '8-999999999, 12, abc' 10) -join ',') -eq '8,9')  "seleção: ignora o que passa do limite e texto inválido"
+Assert (@(ConvertFrom-Selecao '' 10).Count -eq 0)                              "seleção vazia"
+
+if ($PSVersionTable.PSEdition -ne 'Core' -or $IsWindows) {
+    $pastaSegura = Join-Path $tmp 'segura\sub'
+    New-PastaSegura $pastaSegura
+    $aclSegura = Get-Acl $pastaSegura
+    $sidsSegura = @($aclSegura.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value })
+    $eu = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Assert ($aclSegura.AreAccessRulesProtected)                                  "pasta segura: herança desativada"
+    Assert (-not ($sidsSegura | Where-Object { $_ -notin $eu, 'S-1-5-18', 'S-1-5-32-544' }) -and $sidsSegura -contains $eu) "pasta segura: só usuário atual, SYSTEM e Administradores"
 }
 
 
@@ -48,14 +87,14 @@ Report Refresh Date,Site Id,Site URL,Owner Display Name,Is Deleted,Last Activity
 2026-10-08,a3,,Ciclano,False,$((Get-Date).AddDays(-200).ToString('yyyy-MM-dd')),5,0,0,0,0,1099511627776,STS#3,c@x.com,30
 2026-10-08,a4,https://t.sharepoint.com/sites/Velho,X,True,2025-01-01,5,0,0,0,0,0,STS#3,x@x.com,30
 "@
-$global:graphPatch = 0
+$global:graphPatch = New-Object System.Collections.Generic.List[object]
 function global:Get-MgContext { [pscustomobject]@{ Scopes = @('Reports.Read.All','Sites.Read.All','ReportSettings.Read.All'); Account = 'teste' } }
 function global:Connect-MgGraph { }
 function global:Import-Module { }
 function global:Invoke-MgGraphRequest { param($Method, $Uri, $OutputFilePath, $Body, $ContentType)
     if ($OutputFilePath) { $global:spCsv | Set-Content $OutputFilePath -Encoding utf8; return }
     if ($Uri -like '*reportSettings*') {
-        if ($Method -eq 'PATCH') { $global:graphPatch++; return }
+        if ($Method -eq 'PATCH') { $global:graphPatch.Add(($Body | ConvertFrom-Json)); return }
         return @{ displayConcealedNames = $true }
     }
     if ($Uri -like '*Financeiro*') { return @{ displayName = 'Financeiro Corp' } }
@@ -65,12 +104,15 @@ function global:Invoke-MgGraphRequest { param($Method, $Uri, $OutputFilePath, $B
 $saidaSp = Join-Path $tmp 'sp'
 $avisos  = & (Join-Path $raiz 'Sharepoint.ps1') -Out $saidaSp -IncluirOneDrive 3>&1 6>$null | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
 $csvSp   = Get-ChildItem $saidaSp -Filter 'SharePoint-Auditoria-*.csv' | Select-Object -First 1
-$linhas  = @(Import-Csv $csvSp.FullName -Delimiter (Get-Culture).TextInfo.ListSeparator)
+$linhas  = @(Import-Csv $csvSp.FullName -Delimiter ';')
 
 Assert ($null -ne $csvSp)                                         "gera o CSV de auditoria"
 Assert ($linhas.Count -eq 3)                                      "ignora o site excluído (3 de 4)"
+Assert ((Get-Content $csvSp.FullName -TotalCount 1) -match '^"Titulo";"Url";') "CSV sempre com separador ';' (independe da cultura)"
+Assert (@(Get-ChildItem $saidaSp -Filter '*-bruto-*').Count -eq 0) "apaga os relatórios brutos do Graph (com UPNs) no final"
+Assert (@($avisos | Where-Object Message -match 'Título do site não obtido').Count -eq 1) "falha ao buscar o título no Graph gera aviso (não é engolida)"
 Assert (@($avisos | Where-Object Message -match 'OCULTOS').Count -gt 0) "avisa quando os nomes estão ocultos"
-Assert ($global:graphPatch -eq 0)                                 "não altera o tenant sem -RevelarNomes"
+Assert ($global:graphPatch.Count -eq 0)                           "não altera o tenant sem -RevelarNomes"
 $fin = $linhas | Where-Object Url -like '*Financeiro'
 Assert ($fin.Titulo -eq 'Financeiro Corp')                        "busca o título real via Graph"
 Assert ($fin.Status -eq 'Ativo' -and $fin.Alertas -match 'Cota')  "site cheio: Ativo + alerta de cota"
@@ -81,8 +123,14 @@ $oculto = $linhas | Where-Object Url -like '(oculto)*'
 Assert ($oculto.Status -eq 'Inativo')                             "site sem URL é mantido e classificado como Inativo"
 Assert ((Get-ChildItem $saidaSp -Filter 'OneDrive-Uso-*.csv').Count -eq 1) "gera o CSV do OneDrive com -IncluirOneDrive"
 
-& (Join-Path $raiz 'Sharepoint.ps1') -Out $saidaSp -RevelarNomes 3>$null 6>$null | Out-Null
-Assert ($global:graphPatch -eq 1)                                 "-RevelarNomes desativa a ocultação (PATCH)"
+& (Join-Path $raiz 'Sharepoint.ps1') -Out $saidaSp -RevelarNomes -WhatIf 3>$null 6>$null | Out-Null
+Assert ($global:graphPatch.Count -eq 0)                           "-RevelarNomes -WhatIf não altera o tenant"
+
+$global:desconexoes.Clear()
+& (Join-Path $raiz 'Sharepoint.ps1') -Out $saidaSp -RevelarNomes -Confirm:$false 3>$null 6>$null | Out-Null
+Assert ($global:graphPatch.Count -eq 2 -and $global:graphPatch[0].displayConcealedNames -eq $false) "-RevelarNomes desativa a ocultação (PATCH)"
+Assert ($global:graphPatch[1].displayConcealedNames -eq $true)    "-RevelarNomes restaura a ocultação original no final"
+Assert ($global:desconexoes -contains 'Graph')                    "desconecta do Graph a sessão que o script abriu"
 
 Remove-Mocks 'Get-MgContext','Connect-MgGraph','Import-Module','Invoke-MgGraphRequest'
 
@@ -103,8 +151,15 @@ function global:Set-Mailbox { param($Identity, $AuditEnabled, $DefaultAuditSet, 
 function global:Get-MailboxAuditBypassAssociation { param($Identity, $ErrorAction)
     [pscustomobject]@{ AuditBypassEnabled = ($Identity -like 'bypass*') } }
 
-$avisos = & (Join-Path $raiz 'Auditoriaexchange.ps1') -Caixas 'a@x.com','bypass@x.com','inexistente@x.com' 3>&1 6>$null |
+function global:Import-Module { }
+
+& (Join-Path $raiz 'Auditoriaexchange.ps1') -Caixas 'a@x.com' -WhatIf 3>$null 6>$null | Out-Null
+Assert ($global:setMailbox.Count -eq 0)                              "-WhatIf não altera as caixas"
+
+$global:desconexoes.Clear()
+$avisos = & (Join-Path $raiz 'Auditoriaexchange.ps1') -Caixas 'a@x.com','bypass@x.com','inexistente@x.com' -Force 3>&1 6>$null |
     Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+Assert ($global:desconexoes.Count -eq 0)                             "não desconecta a sessão do Exchange que já existia"
 
 $resets = @($global:setMailbox | Where-Object { $_.ContainsKey('DefaultAuditSet') })
 $adds   = @($global:setMailbox | Where-Object { $_.ContainsKey('AuditDelegate') })
@@ -115,7 +170,7 @@ Assert (@($avisos | Where-Object Message -match 'DESATIVADA').Count -eq 1) "avis
 Assert (@($avisos | Where-Object Message -match 'bypass@x.com.*AuditBypassEnabled').Count -eq 1) "avisa sobre caixa com bypass"
 Assert (@($avisos | Where-Object Message -match 'Falha ao configurar inexistente').Count -eq 1) "erro numa caixa é reportado e não interrompe as demais"
 
-Remove-Mocks 'Get-ConnectionInformation','Connect-ExchangeOnline','Get-OrganizationConfig','Get-Mailbox','Set-Mailbox','Get-MailboxAuditBypassAssociation'
+Remove-Mocks 'Get-ConnectionInformation','Connect-ExchangeOnline','Get-OrganizationConfig','Get-Mailbox','Set-Mailbox','Get-MailboxAuditBypassAssociation','Import-Module'
 
 
 # ==============================================================================
@@ -159,9 +214,17 @@ function global:Search-UnifiedAuditLog { param($StartDate, $EndDate, $RecordType
     }
 }
 
+function global:Import-Module { }
+# Endereço alternativo resolve para o UPN; caixa desconhecida cai no texto informado
+function global:Get-EXOMailbox { param($Identity, $Properties, $ErrorAction)
+    if ($Identity -in 'boletos@x.com', 'cobranca@x.com') { return [pscustomobject]@{ UserPrincipalName = 'boletos@x.com'; PrimarySmtpAddress = 'cobranca@x.com' } }
+    throw "Couldn't find object $Identity"
+}
+
 $csvEx = Join-Path $tmp 'exchange\rel.csv'
-& (Join-Path $raiz 'ExtracaoExchange.ps1') -Caixas 'boletos@x.com','vazia@x.com' -CsvPath $csvEx 3>$null 6>$null | Out-Null
+& (Join-Path $raiz 'ExtracaoExchange.ps1') -Caixas 'cobranca@x.com','vazia@x.com' -CsvPath $csvEx 3>$null 6>$null | Out-Null
 $linhas = @(Import-Csv $csvEx -Delimiter (Get-Culture).TextInfo.ListSeparator)
+Assert (@($global:ualChamadas | Where-Object FreeText -eq 'cobranca@x.com').Count -eq 0 -and $linhas.Count -gt 0) "endereço SMTP é resolvido para o UPN (MailboxOwnerUPN) antes de buscar e filtrar"
 
 Assert ($global:ualChamadas[0].RecordType -eq 'ExchangeItemGroup')        "busca com RecordType ExchangeItemGroup"
 Assert ($global:ualChamadas[0].SessionCommand -eq 'ReturnLargeSet')       "usa paginação (ReturnLargeSet)"
@@ -172,7 +235,7 @@ Assert (-not ($linhas | Where-Object AssuntoDoEmail -eq 'Outra caixa'))   "desca
 Assert (($linhas | Where-Object AssuntoDoEmail -eq 'Boleto 1').PastaDeDestino -eq '\Itens Excluídos') "lê Folder/DestFolder .Path"
 Assert ($linhas[0].TipoAcesso -eq 'Delegado')                             "traduz LogonType"
 
-Remove-Mocks 'Get-ConnectionInformation','Connect-ExchangeOnline','Search-UnifiedAuditLog'
+Remove-Mocks 'Get-ConnectionInformation','Connect-ExchangeOnline','Search-UnifiedAuditLog','Get-EXOMailbox','Import-Module'
 
 
 # ==============================================================================
@@ -211,6 +274,7 @@ Write-Host "`n== Recuperar-ItensExcluidos.ps1 ==" -ForegroundColor Cyan
 # ==============================================================================
 $global:getRI     = $null
 $global:restoreRI = New-Object System.Collections.Generic.List[hashtable]
+function global:Import-Module { }
 function global:Get-ConnectionInformation { [pscustomobject]@{ State = 'Connected' } }
 function global:Connect-ExchangeOnline { throw 'não deveria reconectar' }
 function global:Get-RecoverableItems { param($Identity, $ResultSize, $SubjectContains, $FilterItemType, $SourceFolder, $FilterStartTime, $FilterEndTime)
@@ -236,10 +300,21 @@ Assert (($global:restoreRI | ForEach-Object EntryID) -join ',' -eq 'E1,E2,E3') "
 Assert (@($global:restoreRI | Where-Object RestoreTargetFolder -eq 'Recuperados').Count -eq 3) "usa -PastaDestino"
 Assert (@($linhas | Where-Object Status -eq 'OK').Count -eq 2 -and @($linhas | Where-Object Status -eq 'Falha').Count -eq 1) "falha num item não interrompe os demais e vai pro relatório"
 
+$global:restoreRI.Clear()
+& (Join-Path $raiz 'Recuperar-ItensExcluidos.ps1') -Caixa 'fin@x.com' -Todos -WhatIf -Relatorio (Join-Path $tmp 'ri\whatif.csv') 3>$null 6>$null | Out-Null
+Assert ($global:restoreRI.Count -eq 0)                                      "-WhatIf não restaura nada"
+
 Remove-Mocks 'Get-RecoverableItems','Restore-RecoverableItems'
 & (Join-Path $raiz 'Recuperar-ItensExcluidos.ps1') -Caixa 'fin@x.com' -Todos -Force 3>$null 6>$null | Out-Null
 Assert ($LASTEXITCODE -eq 1)                                                "sem a função Mailbox Import Export: orienta e sai com erro"
-Remove-Mocks 'Get-ConnectionInformation','Connect-ExchangeOnline'
+
+# Sem sessão: o script conecta e, no final, desconecta o que abriu
+function global:Get-ConnectionInformation { }
+function global:Connect-ExchangeOnline { }
+$global:desconexoes.Clear()
+& (Join-Path $raiz 'Recuperar-ItensExcluidos.ps1') -Caixa 'fin@x.com' -Todos -Force 3>$null 6>$null | Out-Null
+Assert ($global:desconexoes -contains 'Exchange')                           "desconecta do Exchange a sessão que o script abriu (mesmo saindo com erro)"
+Remove-Mocks 'Get-ConnectionInformation','Connect-ExchangeOnline','Import-Module'
 
 
 # ==============================================================================
@@ -466,6 +541,14 @@ $global:imports.Clear()
 & $restaurar -Caixa 'fin@x.com' -Destino $bkp -Assunto 'nao-existe' -Todos -Force 3>$null 6>$null | Out-Null
 Assert ($global:imports.Count -eq 0)                                   "sem resultados: não conecta nem importa nada"
 
+$global:imports.Clear()
+& $restaurar -Caixa 'fin@x.com' -Destino $bkp -Assunto '*' -Todos -Force 3>$null 6>$null | Out-Null
+& $restaurar -Caixa 'fin@x.com' -Destino $bkp -Remetente 'Fornecedor [' -Todos -Force 3>$null 6>$null | Out-Null
+Assert ($global:imports.Count -eq 0)                                   "-Assunto/-Remetente são texto literal (curingas e '[' não quebram o filtro)"
+
+& $restaurar -Caixa 'fin@x.com' -Destino $bkp -Todos -WhatIf 3>$null 6>$null | Out-Null
+Assert ($global:imports.Count -eq 0)                                   "-WhatIf não importa nada"
+
 Remove-Mocks 'Invoke-RestMethod'
 
 
@@ -499,6 +582,14 @@ $global:app.Atribuicoes.Clear()
 & $criarApp -PermitirRestauracao -SemConsentimento 3>$null 6>$null | Out-Null
 Assert (@($global:app.Body.requiredResourceAccess[0].resourceAccess).Count -eq 6) "-PermitirRestauracao acrescenta as permissões de escrita"
 Assert ($global:app.Atribuicoes.Count -eq 0)                            "-SemConsentimento não concede permissões"
+
+$global:app.Atribuicoes.Clear()
+$saidaApp = & $criarApp -PermitirRestauracao -GrupoCaixas 'Backup-Caixas@x.com' 6>&1 3>$null | Out-String
+$acessos  = @($global:app.Body.requiredResourceAccess[0].resourceAccess)
+Assert ($acessos.Count -eq 1 -and $acessos[0].id -eq 'role-User.Read.All' -and $global:app.Atribuicoes.Count -eq 1) "-GrupoCaixas: no Entra ID só User.Read.All (caixas ficam para o RBAC do Exchange)"
+Assert ($saidaApp -match "New-ManagementScope -Name '.*' -RecipientRestrictionFilter" -and
+        $saidaApp -match "New-ManagementRoleAssignment -App sp-1 -Role 'Application MailboxItem.Export' -CustomResourceScope" -and
+        $saidaApp -match "Role 'Application MailboxItem.ImportExport'") "-GrupoCaixas: mostra os comandos do RBAC para Aplicativos com escopo no grupo"
 
 Remove-Mocks 'New-SelfSignedCertificate','Invoke-MgGraphRequest','Get-MgContext','Connect-MgGraph','Import-Module','Get-FakeFolders','New-FakeFolder','Install-Module'
 

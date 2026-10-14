@@ -26,10 +26,13 @@
   .\Backup-Caixa.ps1 -Caixas financeiro@empresa.com.br, boletos@empresa.com.br `
       -TenantId <tenant-id> -ClientId <app-id> -CertificateThumbprint <thumbprint>
 #>
+#Requires -Version 5.1
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, HelpMessage = "E-mails das caixas (ex: financeiro@empresa.com.br)")]
     [string[]]$Caixas,
 
+    # Pastas criadas pelo script só dão acesso ao usuário atual, SYSTEM e Administradores
     [string]$Destino = 'C:\Backup\Exchange',
 
     # Caminhos de pasta a ignorar; aceita curinga (ex: 'Lixo Eletrônico', 'Inbox/Newsletter*')
@@ -52,7 +55,8 @@ $script:VersaoEstado = 2
 
 $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 $dirLog = Join-Path $Destino 'logs'
-New-Item -ItemType Directory $dirLog -Force | Out-Null
+New-PastaSegura $Destino
+New-PastaSegura $dirLog
 Start-Transcript -Path (Join-Path $dirLog "backup-$stamp.log") | Out-Null
 
 
@@ -233,7 +237,8 @@ try {
             $script:arqEstado = Join-Path $script:dirCaixa 'estado.json'
             $script:arqIndice = Join-Path $script:dirCaixa 'indice.csv'
             $script:arqFalhas = Join-Path $script:dirCaixa 'falhas.log'
-            New-Item -ItemType Directory (Join-Path $script:dirCaixa 'itens') -Force | Out-Null
+            New-PastaSegura $script:dirCaixa   # protegida mesmo se -Destino já existia com acesso amplo
+            $null = New-Item -ItemType Directory (Join-Path $script:dirCaixa 'itens') -Force
 
             $script:mbx    = Get-MailboxId $script:caixa
             $script:indice = Import-Indice $script:arqIndice
@@ -294,6 +299,7 @@ try {
         }
     }
 } finally {
+    Disconnect-GraphSeConectado
     Stop-Transcript | Out-Null
 }
 

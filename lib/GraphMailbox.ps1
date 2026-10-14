@@ -4,7 +4,10 @@
   (API de import/export de caixas do Microsoft Graph, v1.0).
 #>
 
+. (Join-Path $PSScriptRoot 'Common.ps1')
+
 $script:GraphBase = 'v1.0/admin/exchange/mailboxes'
+$script:GraphConectadoPorScript = $false
 
 # Conecta ao Graph em modo interativo (escopos delegados) ou como aplicativo (certificado)
 function Connect-GraphBackup {
@@ -15,11 +18,7 @@ function Connect-GraphBackup {
         [string]$CertificateThumbprint
     )
 
-    if (-not (Get-Module -ListAvailable Microsoft.Graph.Authentication)) {
-        Write-Host "Instalando módulo: Microsoft.Graph.Authentication ..." -ForegroundColor Yellow
-        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -Repository PSGallery
-    }
-    Import-Module Microsoft.Graph.Authentication
+    Initialize-Modulo -Nome Microsoft.Graph.Authentication -VersaoMinima 2.0.0
 
     $ctx = Get-MgContext
     if ($ClientId) {
@@ -28,14 +27,27 @@ function Connect-GraphBackup {
         }
         if ($null -eq $ctx -or $ctx.ClientId -ne $ClientId -or "$($ctx.AuthType)" -ne 'AppOnly') {
             Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint -NoWelcome
+            $script:GraphConectadoPorScript = $true
         }
         Write-Host "Conectado ao Graph como aplicativo ($ClientId)" -ForegroundColor Green
     } else {
         if ($null -eq $ctx -or ($Escopos | Where-Object { $_ -notin $ctx.Scopes })) {
             Connect-MgGraph -Scopes $Escopos -NoWelcome
+            $script:GraphConectadoPorScript = $true
         }
         Write-Host "Conectado ao Graph: $((Get-MgContext).Account)" -ForegroundColor Green
     }
+}
+
+# Desconecta só se a sessão foi aberta por Connect-GraphBackup neste script
+function Disconnect-GraphSeConectado {
+    if (-not $script:GraphConectadoPorScript) { return }
+    try {
+        $null = Disconnect-MgGraph -ErrorAction Stop
+    } catch {
+        Write-Verbose "Falha ao desconectar do Graph: $($_.Exception.Message)"
+    }
+    $script:GraphConectadoPorScript = $false
 }
 
 function Get-HttpStatus($Erro) {
@@ -68,7 +80,9 @@ function Invoke-GraphRetry {
             try {
                 $ra = $_.Exception.Response.Headers.RetryAfter.Delta
                 if ($ra) { $espera = [math]::Ceiling($ra.TotalSeconds) }
-            } catch {}
+            } catch {
+                Write-Verbose "Sem Retry-After utilizável na resposta: $($_.Exception.Message)"
+            }
             Write-Warning "Graph respondeu $status; nova tentativa em ${espera}s ($i/$Tentativas)"
             Start-Sleep -Seconds $espera
         }

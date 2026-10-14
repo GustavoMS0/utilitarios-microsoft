@@ -38,11 +38,14 @@
   # Só prepara a exportação; o download é feito depois pelo portal
   .\Exportar-PST.ps1 -Caixa ex.colaborador@empresa.com.br -SemDownload
 #>
+#Requires -Version 5.1
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, HelpMessage = "E-mail da caixa a exportar (ex: ex.colaborador@empresa.com.br)")]
     [ValidateNotNullOrEmpty()]
     [string]$Caixa,
 
+    # Pastas criadas pelo script só dão acesso ao usuário atual, SYSTEM e Administradores
     [string]$Destino = 'C:\Backup\PST',
 
     # O que exportar; combine vários (ex: -Conteudo Email, Calendario). Padrão: a caixa inteira.
@@ -112,7 +115,9 @@ function Get-DetalheErro($Erro) {
         try {
             $j = $texto.Substring($ini) | ConvertFrom-Json
             if ($j.error.message) { return "$($j.error.code): $($j.error.message)" }
-        } catch {}
+        } catch {
+            Write-Verbose "Detalhe do erro não é JSON: $($_.Exception.Message)"
+        }
     }
     return $Erro.Exception.Message
 }
@@ -177,9 +182,24 @@ function Get-TokenNavegador([string]$TenantId, [string]$Conta) {
     $desafio     = ConvertTo-Base64Url ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::ASCII.GetBytes($verificador)))
     $estado      = [guid]::NewGuid().ToString('N')
 
-    $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-    $tcp.Start(); $porta = $tcp.LocalEndpoint.Port; $tcp.Stop()
-    $retorno = "http://localhost:$porta/"
+    # Porta livre escolhida pelo sistema; outro processo pode ocupá-la entre o Stop() e o Start()
+    # do HttpListener, então tenta de novo com outra porta
+    $ouvinte = $null
+    for ($t = 1; -not $ouvinte; $t++) {
+        $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $tcp.Start(); $porta = $tcp.LocalEndpoint.Port; $tcp.Stop()
+        $retorno = "http://localhost:$porta/"
+        $candidato = [System.Net.HttpListener]::new()
+        $candidato.Prefixes.Add($retorno)
+        try {
+            $candidato.Start()
+            $ouvinte = $candidato
+        } catch {
+            $candidato.Close()
+            if ($t -ge 5) { throw "Não foi possível abrir uma porta local para receber o login: $($_.Exception.Message)" }
+            Write-Verbose "Porta $porta ocupada, tentando outra: $($_.Exception.Message)"
+        }
+    }
 
     $params = [ordered]@{
         client_id             = $ClientIdDownload
@@ -195,9 +215,6 @@ function Get-TokenNavegador([string]$TenantId, [string]$Conta) {
     $url = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/authorize?" +
            (($params.Keys | ForEach-Object { "$_=$([uri]::EscapeDataString("$($params[$_])"))" }) -join '&')
 
-    $ouvinte = [System.Net.HttpListener]::new()
-    $ouvinte.Prefixes.Add($retorno)
-    $ouvinte.Start()
     try {
         Write-Host "Abrindo o navegador para o login do download. Se ele não abrir, acesse:" -ForegroundColor Yellow
         Write-Host $url -ForegroundColor DarkGray
@@ -318,220 +335,225 @@ function Get-ExportacaoConcluida([string]$UriCaso) {
 }
 
 
-# ==============================================================================
-# PASSO 1: CONEXÃO
-# ==============================================================================
-Connect-GraphBackup -Escopos 'eDiscovery.ReadWrite.All'
-$tenantId = (Get-MgContext).TenantId
-$conta    = (Get-MgContext).Account
-$base     = 'v1.0/security/cases/ediscoveryCases'
-$limite   = (Get-Date).AddMinutes($AguardarMinutos)
-$prefixo  = "Exportação PST - $Caixa - "
-
-$script:caso        = $null
-$script:custodiante = $null
-$script:etapa       = ''
-
-# Parâmetro [datetime] não informado vale DateTime.MinValue, por isso checamos se foi passado
-$script:temDe  = $PSBoundParameters.ContainsKey('De')
-$script:temAte = $PSBoundParameters.ContainsKey('Ate')
-if ($script:temDe -and $script:temAte -and $De -gt $Ate) { throw "-De ($($De.ToString('dd/MM/yyyy'))) é posterior a -Ate ($($Ate.ToString('dd/MM/yyyy')))." }
-$kql      = Get-ConsultaKql
-$selecao  = if ($kql) { "Seleção: $($Conteudo -join ', ')" } else { 'Caixa inteira' }
-
-if ($SomenteDownload -or $CasoId) {
-    # ==========================================================================
-    # RETOMADA: usa uma exportação já concluída
-    # ==========================================================================
-    if ($CasoId) {
-        $caso = Invoke-GraphRetry -Uri "$base/$CasoId"
-    } else {
-        $casos = New-Object System.Collections.Generic.List[object]
-        $url = $base
-        while ($url) {
-            $r = Invoke-GraphRetry -Uri $url
-            foreach ($c in $r.value) { $casos.Add($c) }
-            $url = $r.'@odata.nextLink'
-        }
-        $caso = $casos | Where-Object { "$($_.displayName)".StartsWith($prefixo) } |
-            Sort-Object { [datetimeoffset]"$($_.createdDateTime)" } -Descending | Select-Object -First 1
-        if (-not $caso) { throw "Nenhum caso '$prefixo...' encontrado no Purview. Rode sem -SomenteDownload para exportar." }
-    }
-    $nome    = $caso.displayName
-    $uriCaso = "$base/$($caso.id)"
-    Write-Host "`nCaso: $nome" -ForegroundColor Cyan
-    $export = Get-ExportacaoConcluida $uriCaso
-    if (-not $export) { throw "O caso '$nome' não tem exportação concluída. Acompanhe em $portal" }
-} else {
-    $nome = "$prefixo$(Get-Date -Format 'yyyy-MM-dd HHmm')"
-
-    # ==========================================================================
-    # PASSO 2: CASO, PESQUISA E ESTIMATIVA
-    # ==========================================================================
-    try {
-        $script:etapa = 'criar caso'
-        Write-Host "`nCriando caso no Purview: $nome" -ForegroundColor Cyan
-        Write-Host "Conteúdo: $selecao$(if ($kql) { " | consulta: $kql" })"
-        $script:caso = Invoke-GraphRetry -Method POST -Uri $base -Body @{
-            displayName = $nome
-            description = "Exportação da caixa $Caixa em PST (Exportar-PST.ps1), por $conta. $selecao$(if ($kql) { " ($kql)" })"
-        }
-        $uriCaso = "$base/$($script:caso.id)"
-
-        # A pesquisa precisa nascer com a fonte (a caixa do colaborador) já vinculada
-        $script:etapa = 'criar pesquisa'
-        $corpo = @{ displayName = "$selecao - $Caixa" }
-        if ($kql) { $corpo.contentQuery = $kql }   # sem consulta = todo o conteúdo
-        $pesquisa = $null
-        try {
-            # Tentativa 1: fonte embutida na própria pesquisa (não cria custodiante nem retenção)
-            $pesquisa = Invoke-GraphRetry -Method POST -Uri "$uriCaso/searches" -Body ($corpo + @{
-                additionalSources = @(@{ '@odata.type' = '#microsoft.graph.security.userSource'; email = $Caixa; includedSources = 'mailbox' })
-            })
-        } catch {
-            Write-Host "  A API não aceitou a fonte embutida ($(Get-DetalheErro $_)); usando custodiante." -ForegroundColor DarkGray
-        }
-        if (-not $pesquisa) {
-            # Tentativa 2 (caminho documentado): custodiante > fonte só da caixa de correio > pesquisa vinculada
-            $script:etapa = 'adicionar custodiante'
-            $script:custodiante = (Invoke-GraphRetry -Method POST -Uri "$uriCaso/custodians" -Body @{ email = $Caixa }).id
-            $fonte = Invoke-GraphRetry -Method POST -Uri "$uriCaso/custodians/$($script:custodiante)/userSources" -Body @{
-                email = $Caixa; includedSources = 'mailbox'
-            }
-            $script:etapa = 'criar pesquisa'
-            $vinculo  = "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases/$($script:caso.id)/custodians/$($script:custodiante)/userSources/$($fonte.id)"
-            $pesquisa = Invoke-GraphRetry -Method POST -Uri "$uriCaso/searches" -Body ($corpo + @{ 'custodianSources@odata.bind' = @($vinculo) })
-        }
-        $uriPesquisa = "$uriCaso/searches/$($pesquisa.id)"
-
-        $script:etapa = 'estimativa'
-        Write-Host "Calculando a estimativa..." -ForegroundColor Cyan
-        $null = Invoke-GraphRetry -Method POST -Uri "$uriPesquisa/estimateStatistics"
-        $est  = Wait-Operacao "$uriPesquisa/lastEstimateStatisticsOperation" 'Estimativa' $limite
-        $gb   = [double]$est.indexedItemsSize / 1GB
-        Write-Host ("Estimativa: {0} itens ({1:N2} GB) + {2} itens não indexados" -f $est.indexedItemCount, $gb, $est.unindexedItemCount) -ForegroundColor Green
-        if ([long]$est.indexedItemCount -eq 0 -and [long]$est.unindexedItemCount -eq 0) {
-            Write-Warning "A pesquisa não encontrou nada. Confira o endereço da caixa e a consulta."
-            exit 1
-        }
-
-
-        # ======================================================================
-        # PASSO 3: EXPORTAÇÃO EM PST
-        # ======================================================================
-        $script:etapa = 'exportação'
-        Write-Host "`nIniciando a exportação em PST..." -ForegroundColor Cyan
-        $null = Invoke-GraphRetry -Method POST -Uri "$uriPesquisa/exportResult" -Headers $cabecalhos -Body @{
-            displayName       = "PST - $Caixa"
-            # Não indexados (ex: anexos criptografados) não dá para filtrar: com filtro, só entram com -IncluirNaoIndexados
-            exportCriteria    = $(if ($kql -and -not $IncluirNaoIndexados) { 'searchHits' } else { 'searchHits, partiallyIndexed' })
-            exportLocation    = 'responsiveLocations'
-            additionalOptions = 'includeFolderAndPath, splitSource'   # estrutura de pastas original; um PST por caixa
-            exportFormat      = 'pst'
-        }
-
-        # A operação criada é a exportação mais recente do caso
-        $opExport = $null
-        for ($t = 0; $t -lt 10 -and -not $opExport; $t++) {
-            $ops = (Invoke-GraphRetry -Uri "$uriCaso/operations" -Headers $cabecalhos).value
-            $opExport = $ops | Where-Object { $_.action -eq 'exportResult' } |
-                Sort-Object { [datetimeoffset]"$($_.createdDateTime)" } -Descending | Select-Object -First 1
-            if (-not $opExport) { Start-Sleep -Seconds 5 }
-        }
-        if (-not $opExport) { throw "A exportação foi solicitada, mas a operação não apareceu no caso. Acompanhe em $portal" }
-
-        $export = Wait-Operacao "$uriCaso/operations/$($opExport.id)" 'Exportação' $limite
-    } catch {
-        Write-Orientacao (Get-DetalheErro $_)
-        exit 1
-    } finally {
-        # Adicionar custodiante pode colocar a caixa em retenção (hold): libera ao terminar
-        if ($script:custodiante) {
-            try {
-                $null = Invoke-GraphRetry -Method POST -Uri "$uriCaso/custodians/$($script:custodiante)/release"
-                Write-Host "Custodiante liberado no caso (sem retenção na caixa)." -ForegroundColor DarkGray
-            } catch {
-                Write-Warning "Não foi possível liberar o custodiante do caso: libere no portal para retirar a retenção da caixa ($(Get-DetalheErro $_))."
-            }
-        }
-    }
-}
-
-$arquivos = @($export.exportFileMetadata | Where-Object { $_.downloadUrl })
-if ($arquivos.Count -eq 0) {
-    throw "A exportação do caso '$nome' não tem arquivos disponíveis para download (as exportações expiram após alguns dias). Rode sem -SomenteDownload para exportar de novo."
-}
-Write-Host "Exportação concluída ($($export.status)): $($arquivos.Count) arquivo(s)." -ForegroundColor Green
-if ($export.status -eq 'partiallySucceeded') {
-    Write-Warning "A exportação terminou parcialmente: confira o relatório no pacote ou no portal."
-}
-$retomar = ".\Exportar-PST.ps1 -Caixa $Caixa -SomenteDownload"
-
-if ($SemDownload) {
-    Write-Host "`nPara baixar: $retomar" -ForegroundColor Yellow
-    Write-Host "Ou pelo portal: $portal > Casos > '$nome' > Exportações. Baixe nos próximos dias (disponibilidade limitada)."
-    exit 0
-}
-
-
-# ==============================================================================
-# PASSO 4: DOWNLOAD
-# ==============================================================================
-$dirSaida = Join-Path $Destino ($nome -replace '[\\/:*?"<>|]', '_')
-New-Item -ItemType Directory $dirSaida -Force | Out-Null
-
-$baixados = New-Object System.Collections.Generic.List[string]
 try {
-    Write-Host "`nO download exige um segundo login (serviço de arquivos do Purview)." -ForegroundColor Cyan
+    # ==============================================================================
+    # PASSO 1: CONEXÃO
+    # ==============================================================================
+    Connect-GraphBackup -Escopos 'eDiscovery.ReadWrite.All'
+    $tenantId = (Get-MgContext).TenantId
+    $conta    = (Get-MgContext).Account
+    $base     = 'v1.0/security/cases/ediscoveryCases'
+    $limite   = (Get-Date).AddMinutes($AguardarMinutos)
+    $prefixo  = "Exportação PST - $Caixa - "
+
+    $script:caso        = $null
+    $script:custodiante = $null
+    $script:etapa       = ''
+
+    # Parâmetro [datetime] não informado vale DateTime.MinValue, por isso checamos se foi passado
+    $script:temDe  = $PSBoundParameters.ContainsKey('De')
+    $script:temAte = $PSBoundParameters.ContainsKey('Ate')
+    if ($script:temDe -and $script:temAte -and $De -gt $Ate) { throw "-De ($($De.ToString('dd/MM/yyyy'))) é posterior a -Ate ($($Ate.ToString('dd/MM/yyyy')))." }
+    $kql      = Get-ConsultaKql
+    $selecao  = if ($kql) { "Seleção: $($Conteudo -join ', ')" } else { 'Caixa inteira' }
+
+    if ($SomenteDownload -or $CasoId) {
+        # ==========================================================================
+        # RETOMADA: usa uma exportação já concluída
+        # ==========================================================================
+        if ($CasoId) {
+            $caso = Invoke-GraphRetry -Uri "$base/$CasoId"
+        } else {
+            $casos = New-Object System.Collections.Generic.List[object]
+            $url = $base
+            while ($url) {
+                $r = Invoke-GraphRetry -Uri $url
+                foreach ($c in $r.value) { $casos.Add($c) }
+                $url = $r.'@odata.nextLink'
+            }
+            $caso = $casos | Where-Object { "$($_.displayName)".StartsWith($prefixo) } |
+                Sort-Object { [datetimeoffset]"$($_.createdDateTime)" } -Descending | Select-Object -First 1
+            if (-not $caso) { throw "Nenhum caso '$prefixo...' encontrado no Purview. Rode sem -SomenteDownload para exportar." }
+        }
+        $nome    = $caso.displayName
+        $uriCaso = "$base/$($caso.id)"
+        Write-Host "`nCaso: $nome" -ForegroundColor Cyan
+        $export = Get-ExportacaoConcluida $uriCaso
+        if (-not $export) { throw "O caso '$nome' não tem exportação concluída. Acompanhe em $portal" }
+    } else {
+        $nome = "$prefixo$(Get-Date -Format 'yyyy-MM-dd HHmm')"
+
+        # ==========================================================================
+        # PASSO 2: CASO, PESQUISA E ESTIMATIVA
+        # ==========================================================================
+        try {
+            $script:etapa = 'criar caso'
+            Write-Host "`nCriando caso no Purview: $nome" -ForegroundColor Cyan
+            Write-Host "Conteúdo: $selecao$(if ($kql) { " | consulta: $kql" })"
+            $script:caso = Invoke-GraphRetry -Method POST -Uri $base -Body @{
+                displayName = $nome
+                description = "Exportação da caixa $Caixa em PST (Exportar-PST.ps1), por $conta. $selecao$(if ($kql) { " ($kql)" })"
+            }
+            $uriCaso = "$base/$($script:caso.id)"
+
+            # A pesquisa precisa nascer com a fonte (a caixa do colaborador) já vinculada
+            $script:etapa = 'criar pesquisa'
+            $corpo = @{ displayName = "$selecao - $Caixa" }
+            if ($kql) { $corpo.contentQuery = $kql }   # sem consulta = todo o conteúdo
+            $pesquisa = $null
+            try {
+                # Tentativa 1: fonte embutida na própria pesquisa (não cria custodiante nem retenção)
+                $pesquisa = Invoke-GraphRetry -Method POST -Uri "$uriCaso/searches" -Body ($corpo + @{
+                    additionalSources = @(@{ '@odata.type' = '#microsoft.graph.security.userSource'; email = $Caixa; includedSources = 'mailbox' })
+                })
+            } catch {
+                Write-Host "  A API não aceitou a fonte embutida ($(Get-DetalheErro $_)); usando custodiante." -ForegroundColor DarkGray
+            }
+            if (-not $pesquisa) {
+                # Tentativa 2 (caminho documentado): custodiante > fonte só da caixa de correio > pesquisa vinculada
+                $script:etapa = 'adicionar custodiante'
+                $script:custodiante = (Invoke-GraphRetry -Method POST -Uri "$uriCaso/custodians" -Body @{ email = $Caixa }).id
+                $fonte = Invoke-GraphRetry -Method POST -Uri "$uriCaso/custodians/$($script:custodiante)/userSources" -Body @{
+                    email = $Caixa; includedSources = 'mailbox'
+                }
+                $script:etapa = 'criar pesquisa'
+                $vinculo  = "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases/$($script:caso.id)/custodians/$($script:custodiante)/userSources/$($fonte.id)"
+                $pesquisa = Invoke-GraphRetry -Method POST -Uri "$uriCaso/searches" -Body ($corpo + @{ 'custodianSources@odata.bind' = @($vinculo) })
+            }
+            $uriPesquisa = "$uriCaso/searches/$($pesquisa.id)"
+
+            $script:etapa = 'estimativa'
+            Write-Host "Calculando a estimativa..." -ForegroundColor Cyan
+            $null = Invoke-GraphRetry -Method POST -Uri "$uriPesquisa/estimateStatistics"
+            $est  = Wait-Operacao "$uriPesquisa/lastEstimateStatisticsOperation" 'Estimativa' $limite
+            $gb   = [double]$est.indexedItemsSize / 1GB
+            Write-Host ("Estimativa: {0} itens ({1:N2} GB) + {2} itens não indexados" -f $est.indexedItemCount, $gb, $est.unindexedItemCount) -ForegroundColor Green
+            if ([long]$est.indexedItemCount -eq 0 -and [long]$est.unindexedItemCount -eq 0) {
+                Write-Warning "A pesquisa não encontrou nada. Confira o endereço da caixa e a consulta."
+                exit 1
+            }
+
+
+            # ======================================================================
+            # PASSO 3: EXPORTAÇÃO EM PST
+            # ======================================================================
+            $script:etapa = 'exportação'
+            Write-Host "`nIniciando a exportação em PST..." -ForegroundColor Cyan
+            $null = Invoke-GraphRetry -Method POST -Uri "$uriPesquisa/exportResult" -Headers $cabecalhos -Body @{
+                displayName       = "PST - $Caixa"
+                # Não indexados (ex: anexos criptografados) não dá para filtrar: com filtro, só entram com -IncluirNaoIndexados
+                exportCriteria    = $(if ($kql -and -not $IncluirNaoIndexados) { 'searchHits' } else { 'searchHits, partiallyIndexed' })
+                exportLocation    = 'responsiveLocations'
+                additionalOptions = 'includeFolderAndPath, splitSource'   # estrutura de pastas original; um PST por caixa
+                exportFormat      = 'pst'
+            }
+
+            # A operação criada é a exportação mais recente do caso
+            $opExport = $null
+            for ($t = 0; $t -lt 10 -and -not $opExport; $t++) {
+                $ops = (Invoke-GraphRetry -Uri "$uriCaso/operations" -Headers $cabecalhos).value
+                $opExport = $ops | Where-Object { $_.action -eq 'exportResult' } |
+                    Sort-Object { [datetimeoffset]"$($_.createdDateTime)" } -Descending | Select-Object -First 1
+                if (-not $opExport) { Start-Sleep -Seconds 5 }
+            }
+            if (-not $opExport) { throw "A exportação foi solicitada, mas a operação não apareceu no caso. Acompanhe em $portal" }
+
+            $export = Wait-Operacao "$uriCaso/operations/$($opExport.id)" 'Exportação' $limite
+        } catch {
+            Write-Orientacao (Get-DetalheErro $_)
+            exit 1
+        } finally {
+            # Adicionar custodiante pode colocar a caixa em retenção (hold): libera ao terminar
+            if ($script:custodiante) {
+                try {
+                    $null = Invoke-GraphRetry -Method POST -Uri "$uriCaso/custodians/$($script:custodiante)/release"
+                    Write-Host "Custodiante liberado no caso (sem retenção na caixa)." -ForegroundColor DarkGray
+                } catch {
+                    Write-Warning "Não foi possível liberar o custodiante do caso: libere no portal para retirar a retenção da caixa ($(Get-DetalheErro $_))."
+                }
+            }
+        }
+    }
+
+    $arquivos = @($export.exportFileMetadata | Where-Object { $_.downloadUrl })
+    if ($arquivos.Count -eq 0) {
+        throw "A exportação do caso '$nome' não tem arquivos disponíveis para download (as exportações expiram após alguns dias). Rode sem -SomenteDownload para exportar de novo."
+    }
+    Write-Host "Exportação concluída ($($export.status)): $($arquivos.Count) arquivo(s)." -ForegroundColor Green
+    if ($export.status -eq 'partiallySucceeded') {
+        Write-Warning "A exportação terminou parcialmente: confira o relatório no pacote ou no portal."
+    }
+    $retomar = ".\Exportar-PST.ps1 -Caixa $Caixa -SomenteDownload"
+
+    if ($SemDownload) {
+        Write-Host "`nPara baixar: $retomar" -ForegroundColor Yellow
+        Write-Host "Ou pelo portal: $portal > Casos > '$nome' > Exportações. Baixe nos próximos dias (disponibilidade limitada)."
+        exit 0
+    }
+
+
+    # ==============================================================================
+    # PASSO 4: DOWNLOAD
+    # ==============================================================================
+    $dirSaida = Join-Path $Destino ($nome -replace '[\\/:*?"<>|]', '_')
+    New-PastaSegura $Destino
+    New-PastaSegura $dirSaida   # mesmo se -Destino já existia com acesso amplo, o pacote fica protegido
+
+    $baixados = New-Object System.Collections.Generic.List[string]
     try {
-        $token = Get-TokenDownload
+        Write-Host "`nO download exige um segundo login (serviço de arquivos do Purview)." -ForegroundColor Cyan
+        try {
+            $token = Get-TokenDownload
+        } catch {
+            if ("$($_.Exception.Message)" -ne $msgSemSP) { throw }
+            Write-Warning $msgSemSP
+            Write-Warning "É uma configuração única do tenant (o portal do Purview faz o mesmo ao baixar pela primeira vez)."
+            $registrar = $RegistrarServicoDownload -or
+                         ((Read-Host "Registrar agora? Exige Administrador Global ou de Aplicativos (S/N)").Trim().ToUpper() -eq 'S')
+            if (-not $registrar) { throw "Serviço de download não registrado. Para registrar manualmente: $cmdSemSP" }
+            Register-ServicoDownload
+            $token = Get-TokenDownload
+        }
+        $header = @{ Authorization = "Bearer $token"; 'X-AllowWithAADToken' = 'true' }
+
+        foreach ($a in $arquivos) {
+            $arq = Join-Path $dirSaida ($a.fileName -replace '[\\/:*?"<>|]', '_')
+            Write-Host ("  Baixando {0} ({1:N1} MB)..." -f $a.fileName, ([double]$a.size / 1MB))
+            $p = @{ Uri = $a.downloadUrl; Headers = $header; OutFile = $arq; ErrorAction = 'Stop' }
+            if ($PSVersionTable.PSEdition -ne 'Core') { $p.UseBasicParsing = $true }
+            $ProgressPreference = 'SilentlyContinue'   # a barra de progresso deixa downloads grandes muito lentos
+            Invoke-WebRequest @p
+            $baixados.Add($arq)
+        }
     } catch {
-        if ("$($_.Exception.Message)" -ne $msgSemSP) { throw }
-        Write-Warning $msgSemSP
-        Write-Warning "É uma configuração única do tenant (o portal do Purview faz o mesmo ao baixar pela primeira vez)."
-        $registrar = $RegistrarServicoDownload -or
-                     ((Read-Host "Registrar agora? Exige Administrador Global ou de Aplicativos (S/N)").Trim().ToUpper() -eq 'S')
-        if (-not $registrar) { throw "Serviço de download não registrado. Para registrar manualmente: $cmdSemSP" }
-        Register-ServicoDownload
-        $token = Get-TokenDownload
+        Write-Warning "O download falhou: $($_.Exception.Message)"
+        Write-Warning "A exportação continua pronta no Purview. Para tentar de novo SEM exportar outra vez:"
+        Write-Warning "  $retomar        (ou acrescente -CodigoDispositivo para outro tipo de login)"
+        Write-Warning "Ou baixe pelo portal: $portal > Casos > '$nome' > Exportações"
+        exit 1
     }
-    $header = @{ Authorization = "Bearer $token"; 'X-AllowWithAADToken' = 'true' }
 
-    foreach ($a in $arquivos) {
-        $arq = Join-Path $dirSaida ($a.fileName -replace '[\\/:*?"<>|]', '_')
-        Write-Host ("  Baixando {0} ({1:N1} MB)..." -f $a.fileName, ([double]$a.size / 1MB))
-        $p = @{ Uri = $a.downloadUrl; Headers = $header; OutFile = $arq; ErrorAction = 'Stop' }
-        if ($PSVersionTable.PSEdition -ne 'Core') { $p.UseBasicParsing = $true }
-        $ProgressPreference = 'SilentlyContinue'   # a barra de progresso deixa downloads grandes muito lentos
-        Invoke-WebRequest @p
-        $baixados.Add($arq)
+    # Extrai os .zip para chegar aos PSTs
+    if (-not $ManterZip) {
+        foreach ($z in $baixados | Where-Object { $_ -like '*.zip' }) {
+            Expand-Archive -Path $z -DestinationPath ([IO.Path]::Combine($dirSaida, [IO.Path]::GetFileNameWithoutExtension($z))) -Force
+            Remove-Item $z
+        }
     }
-} catch {
-    Write-Warning "O download falhou: $($_.Exception.Message)"
-    Write-Warning "A exportação continua pronta no Purview. Para tentar de novo SEM exportar outra vez:"
-    Write-Warning "  $retomar        (ou acrescente -CodigoDispositivo para outro tipo de login)"
-    Write-Warning "Ou baixe pelo portal: $portal > Casos > '$nome' > Exportações"
-    exit 1
-}
 
-# Extrai os .zip para chegar aos PSTs
-if (-not $ManterZip) {
-    foreach ($z in $baixados | Where-Object { $_ -like '*.zip' }) {
-        Expand-Archive -Path $z -DestinationPath ([IO.Path]::Combine($dirSaida, [IO.Path]::GetFileNameWithoutExtension($z))) -Force
-        Remove-Item $z
+
+    # ==============================================================================
+    # RESUMO
+    # ==============================================================================
+    $psts = @(Get-ChildItem $dirSaida -Recurse -Filter *.pst)
+    Write-Host "`nArquivos em: $dirSaida" -ForegroundColor Green
+    foreach ($p in $psts) { Write-Host ("  {0} ({1:N1} MB)" -f $p.FullName.Substring($dirSaida.Length + 1), ($p.Length / 1MB)) }
+    if ($psts.Count -eq 0 -and -not $ManterZip) {
+        Write-Warning "Nenhum .pst encontrado no pacote baixado. Confira o conteúdo da pasta e o relatório da exportação."
+        exit 1
     }
+    Write-Host "Caso no Purview: '$nome' (fica como registro; pode ser fechado no portal)." -ForegroundColor DarkGray
+    exit 0
+} finally {
+    Disconnect-GraphSeConectado
 }
-
-
-# ==============================================================================
-# RESUMO
-# ==============================================================================
-$psts = @(Get-ChildItem $dirSaida -Recurse -Filter *.pst)
-Write-Host "`nArquivos em: $dirSaida" -ForegroundColor Green
-foreach ($p in $psts) { Write-Host ("  {0} ({1:N1} MB)" -f $p.FullName.Substring($dirSaida.Length + 1), ($p.Length / 1MB)) }
-if ($psts.Count -eq 0 -and -not $ManterZip) {
-    Write-Warning "Nenhum .pst encontrado no pacote baixado. Confira o conteúdo da pasta e o relatório da exportação."
-    exit 1
-}
-Write-Host "Caso no Purview: '$nome' (fica como registro; pode ser fechado no portal)." -ForegroundColor DarkGray
-exit 0

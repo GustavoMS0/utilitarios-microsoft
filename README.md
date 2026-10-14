@@ -27,11 +27,26 @@ para rodar direto depois ou para agendar. Cada script também funciona sozinho, 
 ## Requisitos
 
 - PowerShell 7+ (recomendado) ou Windows PowerShell 5.1
-- Módulos (os scripts instalam automaticamente no escopo do usuário se faltarem):
-  - `Microsoft.Graph.Authentication` (+ `Users`, `Groups`, `Identity.DirectoryManagement` para o NewClone)
+- Módulos (se faltarem, os scripts instalam no escopo do usuário, com versão mínima fixada e pedindo confirmação
+  da PSGallery, sem `-Force`/`-AllowClobber`):
+  - `Microsoft.Graph.Authentication` 2.0+ (+ `Users`, `Groups`, `Identity.DirectoryManagement` para o NewClone)
   - `ExchangeOnlineManagement` 3.2+
   - `Microsoft.Online.SharePoint.PowerShell` — só para `Sharepoint.ps1 -SpoAdminUrl`
 - Conta com as funções adequadas (ver cada script).
+- Os arquivos `.ps1` são UTF-8 **com BOM** (sem ele o Windows PowerShell 5.1 corrompe os acentos); os testes verificam isso.
+
+### Segurança
+
+- **Pastas de saída protegidas:** relatórios, backups e PSTs têm e-mails, nomes e UPNs, e pastas como `C:\Temp` e
+  `C:\Backup` herdam leitura para `BUILTIN\Users`. Toda pasta de saída **criada** pelos scripts tem a herança
+  desativada e acesso só para o usuário atual, `SYSTEM` e Administradores (`New-PastaSegura`, em `lib\Common.ps1`).
+  Pastas que já existiam não são alteradas, mas o script avisa se elas derem acesso a Users/Authenticated
+  Users/Everyone e mostra o `icacls` para restringir. Se o backup agendado rodar com **outra conta**, dê acesso a
+  ela na pasta (`icacls <pasta> /grant "DOMINIO\conta:(OI)(CI)M"`).
+- **Alterações pedem confirmação:** os scripts que mudam algo no tenant aceitam `-WhatIf` (só mostra o que faria) e
+  `-Confirm`; `-Force` pula a confirmação onde existe.
+- **Sessões:** cada script desconecta, no final, as sessões do Graph/Exchange que ele mesmo abriu (as que já existiam
+  continuam abertas).
 
 ---
 
@@ -54,13 +69,16 @@ Interativo. Pede o usuário modelo, os dados do novo usuário, gerente e senha t
 
 ```powershell
 .\NewClone.ps1
+.\NewClone.ps1 -UsuarioModelo modelo@empresa.com.br   # já informa o modelo
+.\NewClone.ps1 -WhatIf                                 # faz as perguntas e mostra o resumo, sem criar nada
 ```
 
 ---
 
 ## Sharepoint.ps1 — auditoria do SharePoint
 
-Usa o relatório oficial de uso do Microsoft 365 e gera `SharePoint-Auditoria-<data>.csv` (abre direto no Excel, separador `;`).
+Usa o relatório oficial de uso do Microsoft 365 e gera `SharePoint-Auditoria-<data>.csv` (abre direto no Excel; separador `;`
+sempre, independente da cultura do Windows). Os relatórios brutos baixados do Graph (com os UPNs dos donos) são apagados no final.
 
 **Colunas:** título, URL, tipo do site (Teams, Comunicação…), hub, dono, status (*Ativo / Pouco usado / Inativo / Nunca usado*), última atividade, arquivos e % ativos, páginas vistas, GB usados, cota e % da cota, compartilhamento externo e **Alertas** (sem dono, inativo, cota alta, link anônimo, bloqueado).
 
@@ -82,8 +100,9 @@ Usa o relatório oficial de uso do Microsoft 365 e gera `SharePoint-Auditoria-<d
 | `-AlertaCotaPct` | `90` | % de cota que gera alerta |
 | `-SpoAdminUrl` | — | Admin center do SharePoint, para dados de governança |
 | `-IncluirOneDrive` | — | Gera também `OneDrive-Uso-<data>.csv` |
-| `-RevelarNomes` | — | Desativa a ocultação de nomes nos relatórios **do tenant inteiro** |
-| `-Out` | `C:\Temp\SP-Auditoria` | Pasta de saída |
+| `-RevelarNomes` | — | Desativa a ocultação de nomes nos relatórios **do tenant inteiro** durante a execução. Pede confirmação (`-Confirm:$false` para não pedir, `-WhatIf` para só simular) e restaura o valor original no final |
+| `-ManterNomesRevelados` | — | Com `-RevelarNomes`, não restaura a ocultação (a mudança pode levar alguns minutos para refletir nos relatórios) |
+| `-Out` | `C:\Temp\SP-Auditoria` | Pasta de saída (protegida, ver [Segurança](#segurança)) |
 
 > ⚠️ **URLs vazias?** Por padrão o Microsoft 365 oculta nomes nos relatórios. Desative em
 > *Admin Center → Configurações → Configurações da organização → Relatórios* ou rode com `-RevelarNomes`.
@@ -99,9 +118,11 @@ Avisa se a auditoria estiver desligada na organização ou se a caixa tiver *byp
 
 ```powershell
 .\Auditoriaexchange.ps1 -Caixas financeiro@empresa.com.br, boletos@empresa.com.br
+.\Auditoriaexchange.ps1 -Caixas financeiro@empresa.com.br -WhatIf   # só mostra o que seria alterado
+.\Auditoriaexchange.ps1 -Caixas financeiro@empresa.com.br -Force    # sem confirmação (ex: agendado)
 ```
 
-Sem `-Caixas`, o PowerShell pergunta os endereços interativamente.
+Sem `-Caixas`, o PowerShell pergunta os endereços interativamente. Pede confirmação antes de alterar cada caixa.
 
 > Por que não `Set-Mailbox -AuditDelegate Move, SoftDelete, ...`? Esse formato **substitui** a lista padrão
 > e desliga ações importantes como `UpdateInboxRules` (regras de encaminhamento). Use sempre `@{Add = ...}`.
@@ -117,10 +138,14 @@ $caixas = 'financeiro@empresa.com.br', 'boletos@empresa.com.br'
 
 .\ExtracaoExchange.ps1 -Caixas $caixas                      # últimos 7 dias
 .\ExtracaoExchange.ps1 -Caixas $caixas -Dias 30 -GridView   # 30 dias e abre janela interativa
-.\ExtracaoExchange.ps1 -Caixas $caixas -CsvPath C:\Temp\rel.csv
+.\ExtracaoExchange.ps1 -Caixas $caixas -CsvPath C:\Relatorios\rel.csv
 ```
 
+Por padrão o CSV vai para `C:\Temp\Auditoria-Exchange\` (pasta protegida, ver [Segurança](#segurança)).
+
 Notas:
+- A caixa pode ser informada pelo UPN ou por qualquer endereço de e-mail: o script resolve o UPN com `Get-EXOMailbox`
+  (o log registra o dono pelo UPN). Sem permissão para ler a caixa, usa o endereço informado e avisa.
 - Ações de mover/excluir são do tipo `ExchangeItemGroup` no log (não `ExchangeItem`).
 - A busca é paginada; o limite do serviço é 50.000 registros por consulta — reduza `-Dias` se aparecer o aviso.
 - Retenção do log: 180 dias (Audit Standard) ou mais com Audit Premium.
@@ -148,7 +173,10 @@ Lista os itens das pastas *Itens Excluídos* e *Itens Recuperáveis*, deixa esco
 ```powershell
 .\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto
 .\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Tipo IPM.Note -De (Get-Date).AddDays(-3) -PastaDestino Recuperados
+.\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto -Todos -WhatIf   # só mostra o que restauraria
 ```
+
+O relatório da restauração vai para `C:\Temp\Recuperacao\` (pasta protegida; mude com `-Relatorio`).
 
 **Permissão:** função *Mailbox Import Export* (não vem atribuída a ninguém por padrão):
 
@@ -187,7 +215,7 @@ C:\Backup\Exchange\
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
 | `-Caixas` | — | Caixas a copiar (usuário ou compartilhada) |
-| `-Destino` | `C:\Backup\Exchange` | Pasta do backup; use um disco/compartilhamento fora do servidor |
+| `-Destino` | `C:\Backup\Exchange` | Pasta do backup (protegida, ver [Segurança](#segurança)); use um disco/compartilhamento fora do servidor |
 | `-ExcluirPastas` | — | Caminhos a ignorar, com curinga (`'Lixo Eletrônico'`, `'Inbox/Newsletter*'`) |
 | `-TenantId` `-ClientId` `-CertificateThumbprint` | — | Modo aplicativo |
 
@@ -206,8 +234,10 @@ recriando dentro dela as pastas originais. Nada que já existe na caixa é alter
 .\Restaurar-Backup.ps1 -Caixa ex.funcionario@empresa.com.br -CaixaDestino gestor@empresa.com.br -Remetente fornecedor.com.br -Todos
 ```
 
-Filtros: `-Assunto`, `-Remetente` (nome ou e-mail), `-Pasta` (curinga), `-De`, `-Ate`, `-SomenteRemovidos`.
-Opções: `-CaixaDestino`, `-PastaRestauracao`, `-SemEstrutura`, `-GridView` (seleção em janela), `-Todos`, `-Force`.
+Filtros: `-Assunto` e `-Remetente` (nome ou e-mail; texto literal: `*` e `[` não são curingas), `-Pasta` (curinga), `-De`,
+`-Ate`, `-SomenteRemovidos`.
+Opções: `-CaixaDestino`, `-PastaRestauracao`, `-SemEstrutura`, `-GridView` (seleção em janela), `-Todos`, `-Force`,
+`-WhatIf` (mostra o que seria restaurado, sem conectar).
 
 ### Login: interativo ou aplicativo
 
@@ -215,7 +245,7 @@ Opções: `-CaixaDestino`, `-PastaRestauracao`, `-SemEstrutura`, `-GridView` (se
 |---|---|---|
 | Configuração | Nenhuma | Cria um app no Entra ID com certificado |
 | Agendamento | Não | Sim |
-| Alcance | Caixas em que sua conta tem permissão | **Todas** as caixas do tenant |
+| Alcance | Caixas em que sua conta tem permissão | **Todas** as caixas do tenant (ou só as de um grupo, com `-GrupoCaixas`) |
 | Permissões Graph | `MailboxFolder.Read`, `MailboxItem.Read`, `MailboxItem.Export`, `User.Read.All` (restaurar: `MailboxFolder.ReadWrite`, `MailboxItem.ImportExport`) | Mesmas, na versão `.All` de aplicativo |
 
 ```powershell
@@ -223,13 +253,35 @@ Opções: `-CaixaDestino`, `-PastaRestauracao`, `-SemEstrutura`, `-GridView` (se
 .\Criar-AppBackup.ps1
 # Backup + restauração; certificado no repositório da máquina (tarefa agendada com outra conta)
 .\Criar-AppBackup.ps1 -PermitirRestauracao -Repositorio LocalMachine
+# Recomendado: app restrito às caixas que são membros diretos de um grupo (RBAC para Aplicativos do Exchange)
+.\Criar-AppBackup.ps1 -GrupoCaixas backup-caixas@empresa.com.br
 ```
+
+O certificado é gerado com a chave privada **não exportável**: ela não sai da máquina onde o script rodou (para
+outro servidor, rode o script lá).
 
 O script mostra o TenantId, o ClientId e o Thumbprint, além do comando pronto para agendar. Exige Administrador Global
 (ou Administrador de Função Privilegiada) para o consentimento; com `-SemConsentimento`, conceda depois no portal.
 
-> ⚠️ Com permissão de aplicativo, quem tiver o certificado lê **qualquer** caixa do tenant. Mantenha o
-> certificado só no servidor de backup e restrinja o acesso à pasta do backup.
+> ⚠️ Com permissão de aplicativo consentida no Entra ID, quem tiver o certificado lê **qualquer** caixa do tenant.
+> Mantenha o certificado só no servidor de backup e restrinja o acesso à pasta do backup.
+
+**Recomendado: restringir o app às caixas do backup** com o
+[RBAC para Aplicativos do Exchange Online](https://learn.microsoft.com/exchange/permissions-exo/application-rbac).
+Com `-GrupoCaixas`, o script consente no Entra ID só `User.Read.All` e mostra os comandos (para rodar conectado ao
+Exchange Online, como *Organization Management*) que concedem as permissões de caixa apenas aos membros do grupo:
+
+```powershell
+New-ServicePrincipal -AppId <ClientId> -ObjectId <id do service principal> -DisplayName 'Backup Exchange - utilitarios-microsoft'
+$dn = (Get-Recipient -Identity 'backup-caixas@empresa.com.br').DistinguishedName
+New-ManagementScope -Name 'Backup Exchange - caixas' -RecipientRestrictionFilter "MemberOfGroup -eq '$dn'"
+New-ManagementRoleAssignment -App <id do service principal> -Role 'Application MailboxItem.Export' -CustomResourceScope 'Backup Exchange - caixas'
+# ... uma atribuição para cada permissão (MailboxFolder.Read, MailboxItem.Read; com restauração, MailboxFolder.ReadWrite e MailboxItem.ImportExport)
+Test-ServicePrincipalAuthorization -Identity <id do service principal> -Resource financeiro@empresa.com.br
+```
+
+As permissões do Entra ID e do RBAC **se somam**: se as permissões de caixa também forem consentidas no portal do
+Entra ID, a restrição deixa de valer. Só membros **diretos** do grupo entram no escopo, e a mudança pode levar até 2 horas.
 
 ### Exportar-PST.ps1: PST de colaborador desligado (Purview)
 
@@ -298,4 +350,8 @@ Testes offline: os cmdlets do Graph/Exchange são simulados, nada é alterado no
 pwsh -NoProfile -File .\tests\Run-Tests.ps1
 ```
 
-Cobrem sintaxe de todos os scripts, a lógica do relatório do SharePoint, a configuração de auditoria, a extração/paginação do audit log, a decisão Graph × Exchange do NewClone e, com uma caixa simulada, o backup incremental (paginação, itens apagados/alterados, token expirado, falhas), a restauração com filtros, a criação do app e, com um Purview simulado, a exportação em PST (filtros, custodiante, login e retomada do download).
+Cobrem sintaxe e codificação (BOM) de todos os scripts, as funções comuns (seleção de itens, pasta protegida), a lógica do relatório do SharePoint, a configuração de auditoria, a extração/paginação do audit log, a decisão Graph × Exchange do NewClone e, com uma caixa simulada, o backup incremental (paginação, itens apagados/alterados, token expirado, falhas), a restauração com filtros, a criação do app e, com um Purview simulado, a exportação em PST (filtros, custodiante, login e retomada do download).
+
+## Licença
+
+[MIT](LICENSE)
