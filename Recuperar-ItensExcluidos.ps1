@@ -66,7 +66,10 @@ param(
     [string]$Relatorio = "C:\Temp\Recuperacao\Recuperacao-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv",
 
     # Emite os registros de resultado da recuperação para o pipeline
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    # Força autenticação por Device Code (evita falhas de WAM / RuntimeBroker em Windows Server / RDP)
+    [switch]$Device
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,7 +78,7 @@ $ErrorActionPreference = 'Stop'
 # ==============================================================================
 # PASSO 0: CONEXÃO E PERMISSÃO
 # ==============================================================================
-Connect-ExchangeSeNecessario
+Connect-ExchangeSeNecessario -Device:$Device
 
 try {
     # Sem a função Mailbox Import Export os cmdlets nem aparecem na sessão

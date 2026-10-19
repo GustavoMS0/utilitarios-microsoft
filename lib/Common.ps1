@@ -28,12 +28,72 @@ function Initialize-Modulo {
 
 # Conecta ao Exchange Online só se ainda não houver sessão. Guarda se a conexão foi aberta
 # por este script, para Disconnect-ExchangeSeConectado não derrubar a sessão de quem chamou.
+# NOTA: O broker WAM nativo do Windows costuma falhar com "RuntimeBroker NullReferenceException"
+# em Windows Server, sessões RDP ou terminais não-interativos. Caso ocorra, alternamos
+# automaticamente para o Device Code flow (-Device).
 $script:ExoConectadoPorScript = $false
 function Connect-ExchangeSeNecessario {
+    [CmdletBinding()]
+    param(
+        # Força autenticação por Device Code (evita falhas de WAM / RuntimeBroker em Windows Server / RDP)
+        [switch]$Device,
+        [switch]$DisableWAM,
+        [string]$UserPrincipalName
+    )
+
     Initialize-Modulo -Nome ExchangeOnlineManagement -VersaoMinima 3.2.0
     if (Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object State -eq 'Connected') { return }
-    Connect-ExchangeOnline -ShowBanner:$false
-    $script:ExoConectadoPorScript = $true
+
+    $cmd = Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue
+    $suportaDevice = $cmd -and ($cmd.Parameters.Keys -contains 'Device')
+    $suportaDisableWAM = $cmd -and ($cmd.Parameters.Keys -contains 'DisableWAM')
+
+    $splat = @{
+        ShowBanner = $false
+    }
+    if ($UserPrincipalName) {
+        $splat['UserPrincipalName'] = $UserPrincipalName
+    }
+
+    if ($Device) {
+        if ($suportaDevice) {
+            $splat['Device'] = $true
+        } else {
+            Write-Warning "O parâmetro -Device não é suportado nesta versão do ExchangeOnlineManagement."
+        }
+        Connect-ExchangeOnline @splat
+        $script:ExoConectadoPorScript = $true
+        return
+    }
+
+    if ($DisableWAM) {
+        if ($suportaDisableWAM) {
+            $splat['DisableWAM'] = $true
+        } else {
+            Write-Warning "O parâmetro -DisableWAM não é suportado nesta versão do ExchangeOnlineManagement."
+        }
+        Connect-ExchangeOnline @splat
+        $script:ExoConectadoPorScript = $true
+        return
+    }
+
+    # Tentativa interativa padrão com fallback automático para -Device se o broker WAM falhar
+    try {
+        Connect-ExchangeOnline @splat -ErrorAction Stop
+        $script:ExoConectadoPorScript = $true
+    } catch {
+        $exMsg = $_.Exception.ToString()
+        $ehErroBroker = $exMsg -match 'RuntimeBroker|NullReferenceException|WAM|BrokerExtension'
+        if ($suportaDevice -and $ehErroBroker) {
+            Write-Warning "Falha no broker de autenticação WAM do Windows (RuntimeBroker / NullReferenceException)."
+            Write-Host "Alternando automaticamente para autenticação via Device Code (-Device)..." -ForegroundColor Yellow
+            $splat['Device'] = $true
+            Connect-ExchangeOnline @splat
+            $script:ExoConectadoPorScript = $true
+        } else {
+            throw
+        }
+    }
 }
 
 function Disconnect-ExchangeSeConectado {

@@ -29,7 +29,10 @@ param(
     [string[]]$AcoesOwnerExtras    = @('Move'),
 
     # Não pede confirmação
-    [switch]$Force
+    [switch]$Force,
+
+    # Força autenticação por Device Code (evita falhas de WAM / RuntimeBroker em Windows Server / RDP)
+    [switch]$Device
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,7 +42,7 @@ if ($Force -and -not $PSBoundParameters.ContainsKey('Confirm')) { $ConfirmPrefer
 # ==============================================================================
 # PASSO 0: CONEXÃO
 # ==============================================================================
-Connect-ExchangeSeNecessario
+Connect-ExchangeSeNecessario -Device:$Device
 
 try {
     # Se a auditoria estiver desligada na organização, nada do que for feito por caixa vale

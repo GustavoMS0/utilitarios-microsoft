@@ -76,6 +76,46 @@ if ($PSVersionTable.PSEdition -ne 'Core' -or $IsWindows) {
     Assert (-not ($sidsSegura | Where-Object { $_ -notin $eu, 'S-1-5-18', 'S-1-5-32-544' }) -and $sidsSegura -contains $eu) "pasta segura: só usuário atual, SYSTEM e Administradores"
 }
 
+# Teste de Connect-ExchangeSeNecessario com -Device e fallback de WAM / RuntimeBroker
+$global:exoChamadas = New-Object System.Collections.Generic.List[hashtable]
+$global:simularErroWam = $false
+function global:Get-ConnectionInformation { $null }
+function global:Connect-ExchangeOnline {
+    param([switch]$Device, [switch]$DisableWAM, [switch]$ShowBanner, [string]$UserPrincipalName, $ErrorAction)
+    $global:exoChamadas.Add($PSBoundParameters)
+    if ($global:simularErroWam -and -not $Device) {
+        throw [System.NullReferenceException]::new("Object reference not set to an instance of an object at Microsoft.Identity.Client.Platforms.Features.RuntimeBroker.RuntimeBroker..ctor")
+    }
+}
+function global:Import-Module { }
+
+# 1) Chamada explícita com -Device
+$global:exoChamadas.Clear()
+$global:simularErroWam = $false
+Connect-ExchangeSeNecessario -Device
+Assert ($global:exoChamadas.Count -eq 1 -and $global:exoChamadas[0].Device -eq $true) "Connect-ExchangeSeNecessario: repassa -Device para Connect-ExchangeOnline"
+
+# 2) Falha do WAM broker cai no fallback e chama Connect-ExchangeOnline com -Device
+$global:exoChamadas.Clear()
+$global:simularErroWam = $true
+$script:ExoConectadoPorScript = $false
+$avisosWam = @(
+    Connect-ExchangeSeNecessario 3>&1 6>$null |
+        Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+)
+Assert ($global:exoChamadas.Count -eq 2) "Connect-ExchangeSeNecessario: tenta conexão e após falha WAM tenta de novo"
+Assert ($global:exoChamadas[1].Device -eq $true) "Connect-ExchangeSeNecessario: fallback automático utiliza -Device"
+Assert (@($avisosWam | Where-Object Message -match 'RuntimeBroker').Count -eq 1) "Connect-ExchangeSeNecessario: avisa sobre falha no broker WAM"
+
+# 3) Presença do parâmetro -Device nos scripts de Exchange
+foreach ($scr in 'Auditoriaexchange.ps1', 'ExtracaoExchange.ps1', 'Recuperar-ItensExcluidos.ps1') {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $raiz $scr), [ref]$null, [ref]$null)
+    $params = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    Assert ($params -contains 'Device') "$scr declara o parâmetro -Device"
+}
+
+Remove-Mocks 'Get-ConnectionInformation','Connect-ExchangeOnline','Import-Module'
+
 
 
 # ==============================================================================

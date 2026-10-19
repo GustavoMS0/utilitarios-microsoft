@@ -28,7 +28,10 @@ param(
     [switch]$GridView,
 
     # Emite os registros estruturados de auditoria para o pipeline
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    # Força autenticação por Device Code (evita falhas de WAM / RuntimeBroker em Windows Server / RDP)
+    [switch]$Device
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 # ==============================================================================
 # PASSO 0: CONEXÃO
 # ==============================================================================
-Connect-ExchangeSeNecessario
+Connect-ExchangeSeNecessario -Device:$Device
 
 try {
     # O Unified Audit Log trabalha em UTC
