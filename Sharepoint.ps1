@@ -173,8 +173,32 @@ try {
 
     function ConvertTo-Long([string]$v) { if ($v) { [long]$v } else { 0 } }
 
-    $hoje      = Get-Date
-    $resultado = New-Object System.Collections.Generic.List[object]
+    function Get-SubsitesDoSite([string]$SiteId, [string]$SitePaiUrl, [string]$SitePaiTitulo) {
+        $lista = New-Object System.Collections.Generic.List[object]
+        try {
+            $resp = Invoke-GraphRetry -Uri "v1.0/sites/$($SiteId)/sites?`$select=id,displayName,webUrl,createdDateTime"
+            $filhos = if ($resp.value) { $resp.value } else { @($resp) }
+            foreach ($sub in $filhos) {
+                if (-not $sub -or -not $sub.id) { continue }
+                $lista.Add([pscustomobject]@{
+                    TituloSubsite = $sub.displayName
+                    UrlSubsite    = $sub.webUrl
+                    SitePaiTitulo = $SitePaiTitulo
+                    SitePaiUrl    = $SitePaiUrl
+                    CriadoEm      = $sub.createdDateTime
+                })
+                $netos = Get-SubsitesDoSite -SiteId $sub.id -SitePaiUrl $sub.webUrl -SitePaiTitulo $sub.displayName
+                foreach ($n in $netos) { $lista.Add($n) }
+            }
+        } catch {
+            Write-Verbose "Sem subsites ou erro ao buscar subsites de $($SiteId): $($_.Exception.Message)"
+        }
+        return $lista
+    }
+
+    $hoje          = Get-Date
+    $resultado     = New-Object System.Collections.Generic.List[object]
+    $todosSubsites = New-Object System.Collections.Generic.List[object]
     $i = 0
 
     foreach ($u in $uso) {
@@ -182,13 +206,24 @@ try {
         $url = $u.'Site URL'
         Write-Progress -Activity "Processando sites" -Status "$i/$($uso.Count)" -PercentComplete (100 * $i / [math]::Max($uso.Count, 1))
 
+        # Recupera URL e Título reais via Graph caso venham ocultos no relatório
+        $titulo = $null
+        if (-not $url -and $u.'Site Id') {
+            try {
+                $siteInfo = Invoke-GraphRetry -Uri "v1.0/sites/$($u.'Site Id')?`$select=displayName,webUrl"
+                if ($siteInfo.webUrl)      { $url = $siteInfo.webUrl }
+                if ($siteInfo.displayName) { $titulo = $siteInfo.displayName }
+            } catch {
+                Write-Verbose "Não foi possível resolver site por ID ($($u.'Site Id')): $($_.Exception.Message)"
+            }
+        }
+
         $spo = if ($url) { $spoPorUrl[$url.TrimEnd('/').ToLower()] }
 
         # Título real: SPO > Graph > último trecho da URL
-        $titulo = $null
-        if ($spo) {
+        if ($spo -and -not $titulo) {
             $titulo = $spo.Title
-        } elseif ($url) {
+        } elseif ($url -and -not $titulo) {
             try {
                 $uri  = [uri]$url
                 $path = $uri.AbsolutePath.TrimEnd('/')
@@ -200,6 +235,18 @@ try {
         }
         if (-not $titulo) { $titulo = if ($url) { ([uri]$url).Segments[-1].Trim('/') } else { $u.'Site Id' } }
         if (-not $titulo) { $titulo = '(raiz)' }
+
+        # Coleta de subsites via Graph
+        $subsites = @()
+        if ($u.'Site Id') {
+            $subsites = Get-SubsitesDoSite -SiteId $u.'Site Id' -SitePaiUrl $url -SitePaiTitulo $titulo
+            foreach ($s in $subsites) { $todosSubsites.Add($s) }
+        }
+        $resumoSubsites = if ($subsites.Count -gt 0) {
+            ($subsites | ForEach-Object { "$($_.TituloSubsite) ($($_.UrlSubsite))" }) -join '; '
+        } else {
+            ''
+        }
 
         # Atividade
         $ultimaAtividade = $null
@@ -238,6 +285,8 @@ try {
         $resultado.Add([pscustomobject]@{
             Titulo            = $titulo
             Url               = if ($url) { $url } else { "(oculto) $($u.'Site Id')" }
+            QtdSubsites       = $subsites.Count
+            Subsites          = $resumoSubsites
             Tipo              = $tipo
             Hub               = $hub
             Dono              = $u.'Owner Display Name'
@@ -261,6 +310,12 @@ try {
 
     $csvSaida = Join-Path $Out "SharePoint-Auditoria-$stamp.csv"
     $resultado | Sort-Object UsadoGB -Descending | Export-Csv $csvSaida -Delimiter ';' -NoTypeInformation -Encoding UTF8
+
+    if ($todosSubsites.Count -gt 0) {
+        $csvSubsitesSaida = Join-Path $Out "SharePoint-Subsites-$stamp.csv"
+        $todosSubsites | Export-Csv $csvSubsitesSaida -Delimiter ';' -NoTypeInformation -Encoding UTF8
+        Write-Host "Subsites: $($todosSubsites.Count) encontrados -> $csvSubsitesSaida" -ForegroundColor Green
+    }
 
 
     # ==============================================================================
@@ -304,6 +359,7 @@ try {
     if ($SpoAdminUrl) {
         Write-Host ("Link anônimo:        {0}" -f @($resultado | Where-Object Alertas -match 'anônimo').Count)
     }
+    Write-Host ("Subsites encontrados:{0}" -f $todosSubsites.Count)
 
     Write-Host "`nTop 10 por armazenamento:" -ForegroundColor Cyan
     $resultado | Sort-Object UsadoGB -Descending | Select-Object -First 10 Titulo, Status, UsadoGB, PctCota | Format-Table -AutoSize | Out-Host
