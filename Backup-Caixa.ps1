@@ -44,11 +44,14 @@ param(
     # Modo aplicativo (opcional)
     [string]$TenantId,
     [string]$ClientId,
-    [string]$CertificateThumbprint
+    [string]$CertificateThumbprint,
+
+    # Emite as estatísticas de execução de cada caixa para o pipeline
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\GraphMailbox.ps1')
+. (Join-Path $PSScriptRoot 'lib/GraphMailbox.ps1')
 
 # Versão do formato do estado.json; estados mais antigos forçam uma varredura completa
 $script:VersaoEstado = 2
@@ -224,6 +227,7 @@ function Save-Estado {
 # EXECUÇÃO
 # ==============================================================================
 $caixasComErro = 0
+$resumoExecucao = New-Object System.Collections.Generic.List[object]
 try {
     Connect-GraphBackup -Escopos 'User.Read.All', 'MailboxFolder.Read', 'MailboxItem.Read', 'MailboxItem.Export' `
         -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint
@@ -293,14 +297,38 @@ try {
                 Write-Warning "Detalhes das falhas em: $script:arqFalhas"
                 $caixasComErro++
             }
+            $resumoExecucao.Add([pscustomobject]@{
+                Caixa             = $script:caixa
+                Novos             = $s.Novos
+                Atualizados       = $s.Atualizados
+                RemovidosNaOrigem = $s.Removidos
+                Falhas            = $s.Falhas
+                TamanhoMB         = [math]::Round($s.Bytes / 1MB, 2)
+                TotalNoBackup     = $script:indice.Count
+                Status            = if ($s.Falhas -gt 0) { 'ComFalhas' } else { 'OK' }
+            })
         } catch {
             Write-Warning "Falha no backup de ${script:caixa}: $($_.Exception.Message)"
             $caixasComErro++
+            $resumoExecucao.Add([pscustomobject]@{
+                Caixa             = $script:caixa
+                Novos             = 0
+                Atualizados       = 0
+                RemovidosNaOrigem = 0
+                Falhas            = 1
+                TamanhoMB         = 0
+                TotalNoBackup     = 0
+                Status            = 'Erro'
+            })
         }
     }
 } finally {
     Disconnect-GraphSeConectado
     Stop-Transcript | Out-Null
+}
+
+if ($PassThru) {
+    $resumoExecucao | Write-Output
 }
 
 # Código de saída diferente de zero para o Agendador de Tarefas sinalizar erro

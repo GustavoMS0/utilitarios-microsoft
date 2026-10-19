@@ -45,13 +45,16 @@ param(
     [switch]$ManterNomesRevelados,
 
     # Pasta de saída; se for criada pelo script, só o usuário atual, SYSTEM e Administradores têm acesso
-    [string]$Out = "C:\Temp\SP-Auditoria"
+    [string]$Out = "C:\Temp\SP-Auditoria",
+
+    # Emite os registros de auditoria dos sites para o pipeline
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = 'Stop'
 # -WhatIf vale só para a alteração no tenant ($PSCmdlet.ShouldProcess); o relatório é gerado normalmente
 $WhatIfPreference = $false
-. (Join-Path $PSScriptRoot 'lib\GraphMailbox.ps1')
+. (Join-Path $PSScriptRoot 'lib/GraphMailbox.ps1')
 New-PastaSegura $Out
 $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
 
@@ -365,6 +368,9 @@ try {
     $resultado | Sort-Object UsadoGB -Descending | Select-Object -First 10 Titulo, Status, UsadoGB, PctCota | Format-Table -AutoSize | Out-Host
 
     Write-Host "Relatório gerado em: $csvSaida" -ForegroundColor Green
+    if ($PassThru) {
+        $resultado | Write-Output
+    }
 } finally {
     # Relatórios brutos (com UPNs de todos os donos) não ficam no disco
     foreach ($bruto in $brutos) { Remove-Item -LiteralPath $bruto -Force -ErrorAction SilentlyContinue }

@@ -33,7 +33,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\GraphMailbox.ps1')
+. (Join-Path $PSScriptRoot 'lib/GraphMailbox.ps1')
 
 # ==============================================================================
 # PASSO 0: PRÉ-REQUISITOS E MÓDULOS

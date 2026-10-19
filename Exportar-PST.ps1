@@ -90,7 +90,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\GraphMailbox.ps1')
+. (Join-Path $PSScriptRoot 'lib/GraphMailbox.ps1')
 
 $appPurview   = 'b26e684c-5068-4120-a679-64a5d2c909d9'   # Microsoft Purview eDiscovery (serviço de download)
 $escopoDown   = "$appPurview/eDiscovery.Download.Read"

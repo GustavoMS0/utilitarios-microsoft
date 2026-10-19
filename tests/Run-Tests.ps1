@@ -61,13 +61,13 @@ foreach ($rel in $rastreados) {
 # ==============================================================================
 Write-Host "`n== lib/Common.ps1 ==" -ForegroundColor Cyan
 # ==============================================================================
-. (Join-Path $raiz 'lib\Common.ps1')
+. (Join-Path $raiz 'lib/Common.ps1')
 Assert ((@(ConvertFrom-Selecao '0,3,5-8,3' 10) -join ',') -eq '0,3,5,6,7,8') "seleção: números, intervalos e repetidos"
 Assert ((@(ConvertFrom-Selecao '8-999999999, 12, abc' 10) -join ',') -eq '8,9')  "seleção: ignora o que passa do limite e texto inválido"
 Assert (@(ConvertFrom-Selecao '' 10).Count -eq 0)                              "seleção vazia"
 
 if ($PSVersionTable.PSEdition -ne 'Core' -or $IsWindows) {
-    $pastaSegura = Join-Path $tmp 'segura\sub'
+    $pastaSegura = Join-Path (Join-Path $tmp 'segura') 'sub'
     New-PastaSegura $pastaSegura
     $aclSegura = Get-Acl $pastaSegura
     $sidsSegura = @($aclSegura.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value })
@@ -75,6 +75,41 @@ if ($PSVersionTable.PSEdition -ne 'Core' -or $IsWindows) {
     Assert ($aclSegura.AreAccessRulesProtected)                                  "pasta segura: herança desativada"
     Assert (-not ($sidsSegura | Where-Object { $_ -notin $eu, 'S-1-5-18', 'S-1-5-32-544' }) -and $sidsSegura -contains $eu) "pasta segura: só usuário atual, SYSTEM e Administradores"
 }
+
+
+
+# ==============================================================================
+Write-Host "`n== lib/GraphMailbox.ps1 ==" -ForegroundColor Cyan
+# ==============================================================================
+. (Join-Path $raiz 'lib/GraphMailbox.ps1')
+
+function global:Get-Item {
+    param($Path, $ErrorAction)
+    if ($Path -like '*EXPIRADO*') {
+        return [pscustomobject]@{ NotAfter = (Get-Date).AddDays(-5); Thumbprint = 'EXPIRADO' }
+    }
+    if ($Path -like '*PRESTES_EXPIRAR*') {
+        return [pscustomobject]@{ NotAfter = (Get-Date).AddDays(15); Thumbprint = 'PRESTES_EXPIRAR' }
+    }
+    return $null
+}
+function global:Import-Module { }
+function global:Get-MgContext { $null }
+function global:Connect-MgGraph { }
+
+$avisosExp = @(
+    Connect-GraphBackup -TenantId 't1' -ClientId 'c1' -CertificateThumbprint 'EXPIRADO' 3>&1 6>$null |
+        Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+)
+Assert (@($avisosExp | Where-Object Message -match 'EXPIROU').Count -eq 1) "avisa se o certificado do app já expirou"
+
+$avisosPrestes = @(
+    Connect-GraphBackup -TenantId 't1' -ClientId 'c1' -CertificateThumbprint 'PRESTES_EXPIRAR' 3>&1 6>$null |
+        Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+)
+Assert (@($avisosPrestes | Where-Object Message -match 'expira em \d+ dia').Count -eq 1) "avisa preventivamente se o certificado do app expira em <= 30 dias"
+
+Remove-Mocks 'Get-Item','Import-Module','Get-MgContext','Connect-MgGraph'
 
 
 # ==============================================================================
@@ -122,6 +157,8 @@ Assert ($raizSite.Titulo -eq '(raiz)' -and $raizSite.Status -eq 'Nunca usado' -a
 $oculto = $linhas | Where-Object Url -like '(oculto)*'
 Assert ($oculto.Status -eq 'Inativo')                             "site sem URL é mantido e classificado como Inativo"
 Assert ((Get-ChildItem $saidaSp -Filter 'OneDrive-Uso-*.csv').Count -eq 1) "gera o CSV do OneDrive com -IncluirOneDrive"
+$passSp = & (Join-Path $raiz 'Sharepoint.ps1') -Out $saidaSp -PassThru 3>$null 6>$null
+Assert (@($passSp).Count -eq 3)                                    "-PassThru emite os sites auditados no pipeline"
 
 & (Join-Path $raiz 'Sharepoint.ps1') -Out $saidaSp -RevelarNomes -WhatIf 3>$null 6>$null | Out-Null
 Assert ($global:graphPatch.Count -eq 0)                           "-RevelarNomes -WhatIf não altera o tenant"
@@ -221,10 +258,11 @@ function global:Get-EXOMailbox { param($Identity, $Properties, $ErrorAction)
     throw "Couldn't find object $Identity"
 }
 
-$csvEx = Join-Path $tmp 'exchange\rel.csv'
-& (Join-Path $raiz 'ExtracaoExchange.ps1') -Caixas 'cobranca@x.com','vazia@x.com' -CsvPath $csvEx 3>$null 6>$null | Out-Null
+$csvEx = Join-Path (Join-Path $tmp 'exchange') 'rel.csv'
+$passEx = & (Join-Path $raiz 'ExtracaoExchange.ps1') -Caixas 'cobranca@x.com','vazia@x.com' -CsvPath $csvEx -PassThru 3>$null 6>$null
 $linhas = @(Import-Csv $csvEx -Delimiter (Get-Culture).TextInfo.ListSeparator)
 Assert (@($global:ualChamadas | Where-Object FreeText -eq 'cobranca@x.com').Count -eq 0 -and $linhas.Count -gt 0) "endereço SMTP é resolvido para o UPN (MailboxOwnerUPN) antes de buscar e filtrar"
+Assert (@($passEx).Count -eq $linhas.Count)                                    "-PassThru emite os mesmos registros do CSV no pipeline"
 
 Assert ($global:ualChamadas[0].RecordType -eq 'ExchangeItemGroup')        "busca com RecordType ExchangeItemGroup"
 Assert ($global:ualChamadas[0].SessionCommand -eq 'ReturnLargeSet')       "usa paginação (ReturnLargeSet)"
@@ -289,9 +327,9 @@ function global:Restore-RecoverableItems { param($Identity, $EntryID, $RestoreTa
     if ($EntryID -eq 'E3') { throw 'Item não encontrado' }
 }
 
-$relRI = Join-Path $tmp 'ri\rel.csv'
-& (Join-Path $raiz 'Recuperar-ItensExcluidos.ps1') -Caixa 'fin@x.com' -Assunto boleto -De (Get-Date).AddDays(-2) `
-    -Todos -Force -PastaDestino 'Recuperados' -Relatorio $relRI 3>$null 6>$null | Out-Null
+$relRI = Join-Path (Join-Path $tmp 'ri') 'rel.csv'
+$passRI = & (Join-Path $raiz 'Recuperar-ItensExcluidos.ps1') -Caixa 'fin@x.com' -Assunto boleto -De (Get-Date).AddDays(-2) `
+    -Todos -Force -PastaDestino 'Recuperados' -Relatorio $relRI -PassThru 3>$null 6>$null
 $linhas = @(Import-Csv $relRI -Delimiter (Get-Culture).TextInfo.ListSeparator)
 
 Assert ($global:getRI.SubjectContains -eq 'boleto' -and $global:getRI.FilterStartTime) "repassa filtros de assunto e data"
@@ -299,9 +337,10 @@ Assert (-not $global:getRI.ContainsKey('FilterEndTime'))                    "-At
 Assert (($global:restoreRI | ForEach-Object EntryID) -join ',' -eq 'E1,E2,E3') "restaura cada item pelo EntryID"
 Assert (@($global:restoreRI | Where-Object RestoreTargetFolder -eq 'Recuperados').Count -eq 3) "usa -PastaDestino"
 Assert (@($linhas | Where-Object Status -eq 'OK').Count -eq 2 -and @($linhas | Where-Object Status -eq 'Falha').Count -eq 1) "falha num item não interrompe os demais e vai pro relatório"
+Assert (@($passRI).Count -eq $linhas.Count)                                    "-PassThru emite os registros de restauração no pipeline"
 
 $global:restoreRI.Clear()
-& (Join-Path $raiz 'Recuperar-ItensExcluidos.ps1') -Caixa 'fin@x.com' -Todos -WhatIf -Relatorio (Join-Path $tmp 'ri\whatif.csv') 3>$null 6>$null | Out-Null
+& (Join-Path $raiz 'Recuperar-ItensExcluidos.ps1') -Caixa 'fin@x.com' -Todos -WhatIf -Relatorio (Join-Path (Join-Path $tmp 'ri') 'whatif.csv') 3>$null 6>$null | Out-Null
 Assert ($global:restoreRI.Count -eq 0)                                      "-WhatIf não restaura nada"
 
 Remove-Mocks 'Get-RecoverableItems','Restore-RecoverableItems'
@@ -446,11 +485,12 @@ function Get-Indice {
 function Get-Delta($PastaId) { (@((Get-Content (Join-Path $cx 'estado.json') -Raw | ConvertFrom-Json).Deltas) | Where-Object { $_.PastaId -ceq $PastaId }).Link }
 function Get-Conteudo($Id) { [IO.File]::ReadAllText((Join-Path $cx $indice[$Id].Arquivo)) }
 
-& (Join-Path $raiz 'Backup-Caixa.ps1') -Caixas 'Fin@X.com' -Destino $bkp 3>$null 6>$null | Out-Null
+$passBkp = & (Join-Path $raiz 'Backup-Caixa.ps1') -Caixas 'Fin@X.com' -Destino $bkp -PassThru 3>$null 6>$null
 $exit1      = $LASTEXITCODE
 $indice     = Get-Indice
 $exportados = @($global:mbx.Exports | ForEach-Object { $_ })
 
+Assert (@($passBkp).Count -eq 1 -and $passBkp[0].Caixa -eq 'Fin@X.com' -and $passBkp[0].Status -eq 'ComFalhas') "-PassThru emite resumo da execução da caixa"
 Assert ($indice.Count -eq 6)                                           "1ª execução: 6 itens no índice (o que falhou fica de fora)"
 Assert ($indice.ContainsKey('AAMkCaso1') -and $indice.ContainsKey('aamKcASO1')) "IDs que só diferem em maiúsculas/minúsculas são itens distintos no índice"
 Assert ($indice['AAMkCaso1'].Assunto -eq 'Caso maiúsculo' -and $indice['aamKcASO1'].Assunto -eq 'Caso minúsculo') "...e cada um mantém seus próprios metadados"
@@ -604,7 +644,7 @@ Write-Host "`n== Exportar-PST.ps1 ==" -ForegroundColor Cyan
 $zipFake = Join-Path $tmp 'pv-pacote.zip'
 $dirZip  = Join-Path $tmp 'pv-pacote'
 New-Item -ItemType Directory (Join-Path $dirZip 'Exchange') -Force | Out-Null
-Set-Content (Join-Path $dirZip 'Exchange\ex@x.com.pst') 'PST simulado'
+Set-Content (Join-Path (Join-Path $dirZip 'Exchange') 'ex@x.com.pst') 'PST simulado'
 Set-Content (Join-Path $dirZip 'Summary.csv') 'relatorio'
 Compress-Archive -Path (Join-Path $dirZip '*') -DestinationPath $zipFake -Force
 

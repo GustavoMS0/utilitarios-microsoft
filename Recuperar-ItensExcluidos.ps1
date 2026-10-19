@@ -63,11 +63,14 @@ param(
     [switch]$Force,
 
     # Se a pasta for criada pelo script, só o usuário atual, SYSTEM e Administradores têm acesso
-    [string]$Relatorio = "C:\Temp\Recuperacao\Recuperacao-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    [string]$Relatorio = "C:\Temp\Recuperacao\Recuperacao-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv",
+
+    # Emite os registros de resultado da recuperação para o pipeline
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\Common.ps1')
+. (Join-Path $PSScriptRoot 'lib/Common.ps1')
 
 # ==============================================================================
 # PASSO 0: CONEXÃO E PERMISSÃO
@@ -176,6 +179,9 @@ try {
     $cor = if ($ok -eq $selecionados.Count) { 'Green' } else { 'Yellow' }
     Write-Host "`n$ok de $($selecionados.Count) item(ns) restaurados." -ForegroundColor $cor
     Write-Host "Relatório: $Relatorio"
+    if ($PassThru) {
+        $resultado | Write-Output
+    }
 } finally {
     Disconnect-ExchangeSeConectado
 }

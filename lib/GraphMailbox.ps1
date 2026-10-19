@@ -25,6 +25,22 @@ function Connect-GraphBackup {
         if (-not $TenantId -or -not $CertificateThumbprint) {
             throw "O modo aplicativo exige -TenantId, -ClientId e -CertificateThumbprint."
         }
+
+        if ($CertificateThumbprint) {
+            $cert = Get-Item "Cert:\CurrentUser\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
+            if (-not $cert) {
+                $cert = Get-Item "Cert:\LocalMachine\My\$CertificateThumbprint" -ErrorAction SilentlyContinue
+            }
+            if ($cert) {
+                $dias = [int]($cert.NotAfter - (Get-Date)).TotalDays
+                if ($dias -lt 0) {
+                    Write-Warning "O certificado do aplicativo (Thumbprint: $CertificateThumbprint) EXPIROU em $($cert.NotAfter.ToString('dd/MM/yyyy'))."
+                } elseif ($dias -le 30) {
+                    Write-Warning "ATENÇÃO: O certificado do aplicativo (Thumbprint: $CertificateThumbprint) expira em $dias dia(s) ($($cert.NotAfter.ToString('dd/MM/yyyy'))). Renove-o para evitar falhas no backup agendado."
+                }
+            }
+        }
+
         if ($null -eq $ctx -or $ctx.ClientId -ne $ClientId -or "$($ctx.AuthType)" -ne 'AppOnly') {
             Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint -NoWelcome
             $script:GraphConectadoPorScript = $true

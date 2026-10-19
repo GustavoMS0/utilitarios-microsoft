@@ -33,7 +33,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\Common.ps1')
+. (Join-Path $PSScriptRoot 'lib/Common.ps1')
 if ($Force -and -not $PSBoundParameters.ContainsKey('Confirm')) { $ConfirmPreference = 'None' }
 
 # ==============================================================================

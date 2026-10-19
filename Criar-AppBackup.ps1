@@ -53,7 +53,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\GraphMailbox.ps1')
+. (Join-Path $PSScriptRoot 'lib/GraphMailbox.ps1')
 
 $graphAppId = '00000003-0000-0000-c000-000000000000'
 $permissoesCaixa = @('MailboxFolder.Read.All', 'MailboxItem.Read.All', 'MailboxItem.Export.All')

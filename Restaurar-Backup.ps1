@@ -60,7 +60,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\GraphMailbox.ps1')
+. (Join-Path $PSScriptRoot 'lib/GraphMailbox.ps1')
 
 if (-not $CaixaDestino) { $CaixaDestino = $Caixa }
 $dirCaixa  = Join-Path $Destino $Caixa.ToLower()

@@ -103,6 +103,7 @@ sempre, independente da cultura do Windows). Os relatórios brutos baixados do G
 | `-RevelarNomes` | — | Desativa a ocultação de nomes nos relatórios **do tenant inteiro** durante a execução. Pede confirmação (`-Confirm:$false` para não pedir, `-WhatIf` para só simular) e restaura o valor original no final |
 | `-ManterNomesRevelados` | — | Com `-RevelarNomes`, não restaura a ocultação (a mudança pode levar alguns minutos para refletir nos relatórios) |
 | `-Out` | `C:\Temp\SP-Auditoria` | Pasta de saída (protegida, ver [Segurança](#segurança)) |
+| `-PassThru` | — | Emite os registros de auditoria dos sites no pipeline do PowerShell |
 
 > ⚠️ **URLs vazias?** Por padrão o Microsoft 365 oculta nomes nos relatórios. Desative em
 > *Admin Center → Configurações → Configurações da organização → Relatórios* ou rode com `-RevelarNomes`.
@@ -139,6 +140,7 @@ $caixas = 'financeiro@empresa.com.br', 'boletos@empresa.com.br'
 .\ExtracaoExchange.ps1 -Caixas $caixas                      # últimos 7 dias
 .\ExtracaoExchange.ps1 -Caixas $caixas -Dias 30 -GridView   # 30 dias e abre janela interativa
 .\ExtracaoExchange.ps1 -Caixas $caixas -CsvPath C:\Relatorios\rel.csv
+.\ExtracaoExchange.ps1 -Caixas $caixas -PassThru             # emite os registros para o pipeline (automação)
 ```
 
 Por padrão o CSV vai para `C:\Temp\Auditoria-Exchange\` (pasta protegida, ver [Segurança](#segurança)).
@@ -174,6 +176,7 @@ Lista os itens das pastas *Itens Excluídos* e *Itens Recuperáveis*, deixa esco
 .\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto
 .\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Tipo IPM.Note -De (Get-Date).AddDays(-3) -PastaDestino Recuperados
 .\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto -Todos -WhatIf   # só mostra o que restauraria
+.\Recuperar-ItensExcluidos.ps1 -Caixa financeiro@empresa.com.br -Assunto boleto -Todos -PassThru # emite os resultados no pipeline
 ```
 
 O relatório da restauração vai para `C:\Temp\Recuperacao\` (pasta protegida; mude com `-Relatorio`).
@@ -218,8 +221,9 @@ C:\Backup\Exchange\
 | `-Destino` | `C:\Backup\Exchange` | Pasta do backup (protegida, ver [Segurança](#segurança)); use um disco/compartilhamento fora do servidor |
 | `-ExcluirPastas` | — | Caminhos a ignorar, com curinga (`'Lixo Eletrônico'`, `'Inbox/Newsletter*'`) |
 | `-TenantId` `-ClientId` `-CertificateThumbprint` | — | Modo aplicativo |
+| `-PassThru` | — | Emite resumo de estatísticas de execução de cada caixa no pipeline |
 
-O script sai com código ≠ 0 se alguma caixa tiver falhas, e o Agendador de Tarefas mostra isso como erro.
+O script valida preventivamente a expiração do certificado (aviso antecipado com 30 dias de antecedência ou se já expirado). Sai com código ≠ 0 se alguma caixa tiver falhas, e o Agendador de Tarefas mostra isso como erro.
 
 ### Restaurar-Backup.ps1
 
@@ -350,7 +354,11 @@ Testes offline: os cmdlets do Graph/Exchange são simulados, nada é alterado no
 pwsh -NoProfile -File .\tests\Run-Tests.ps1
 ```
 
-Cobrem sintaxe e codificação (BOM) de todos os scripts, as funções comuns (seleção de itens, pasta protegida), a lógica do relatório do SharePoint, a configuração de auditoria, a extração/paginação do audit log, a decisão Graph × Exchange do NewClone e, com uma caixa simulada, o backup incremental (paginação, itens apagados/alterados, token expirado, falhas), a restauração com filtros, a criação do app e, com um Purview simulado, a exportação em PST (filtros, custodiante, login e retomada do download).
+O repositório possui uma suíte com 176 testes unitários integrados a uma esteira de CI no GitHub Actions (`.github/workflows/ci.yml`), validando continuamente em matriz:
+- **Windows** (PowerShell 7 e Windows PowerShell 5.1)
+- **Ubuntu** (PowerShell 7)
+
+Cobrem sintaxe e integridade de codificação (BOM UTF-8) em todos os scripts, funções de sanitização de pastas NTFS e SIDs, ciclo de vida e avisos preventivos de expiração de certificados (Entra ID), extração paginada e tratamento UTC do Unified Audit Log, pipeline de dados com `-PassThru`, resolução de identidades no NewClone e exportação/restauração granular do Exchange e Purview eDiscovery.
 
 ## Licença
 

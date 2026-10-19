@@ -25,11 +25,14 @@ param(
     [string]$CsvPath = "C:\Temp\Auditoria-Exchange\Auditoria-Exchange-$(Get-Date -Format 'yyyyMMdd-HHmm').csv",
 
     # Abre também a janela interativa (só no Windows)
-    [switch]$GridView
+    [switch]$GridView,
+
+    # Emite os registros estruturados de auditoria para o pipeline
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\Common.ps1')
+. (Join-Path $PSScriptRoot 'lib/Common.ps1')
 
 # ==============================================================================
 # PASSO 0: CONEXÃO
@@ -172,6 +175,9 @@ try {
 
         if ($GridView -and (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
             $ordenado | Out-GridView -Title "Relatório de Auditoria (Unified) - Emails Movidos/Apagados"
+        }
+        if ($PassThru) {
+            $ordenado | Write-Output
         }
     } else {
         Write-Host "`nNão há dados para exibir no período selecionado." -ForegroundColor Yellow
