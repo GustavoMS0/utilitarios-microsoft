@@ -24,7 +24,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run unit tests
-        shell: ${{ matrix.shell }}
+      - name: Run unit tests (PowerShell Core)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          & ./tests/Run-Tests.ps1
+
+      - name: Run unit tests (Windows PowerShell)
+        if: matrix.shell == 'powershell'
+        shell: powershell
         run: |
           & ./tests/Run-Tests.ps1
