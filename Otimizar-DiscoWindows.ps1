@@ -61,26 +61,41 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 
 # -----------------------------------------------------------------------------
-# 1. Elevação de Privilégio (Administrador obrigatório)
+# 1. Elevação de Privilégio (Administrador para limpeza; Análise roda direto)
 # -----------------------------------------------------------------------------
 $ehAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $ehAdmin) {
-    if ($Host.Name -match 'ConsoleHost') {
-        Write-Warning "Este script requer privilégios de Administrador. Solicitando elevação..."
-        $argumentos = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
-        foreach ($k in $PSBoundParameters.Keys) {
-            if ($PSBoundParameters[$k] -is [switch] -and $PSBoundParameters[$k].IsPresent) {
-                $argumentos += "-$k"
-            } elseif ($PSBoundParameters[$k] -isnot [switch]) {
-                $argumentos += "-$k"; $argumentos += "`"$($PSBoundParameters[$k])`""
-            }
-        }
-        Start-Process powershell.exe -ArgumentList $argumentos -Verb RunAs
-        exit
+    if ($Mode -eq 'Analyze') {
+        Write-Host "[MODO ANÁLISE] Executando no terminal atual sem elevação." -ForegroundColor Yellow
+        Write-Host "Nota: Apenas leitura de disco. Para limpeza de pastas protegidas, execute como Administrador.`n" -ForegroundColor Gray
     } else {
-        throw "Execute este script em uma janela do PowerShell como Administrador."
+        if ($Host.Name -match 'ConsoleHost') {
+            Write-Warning "Este script requer privilégios de Administrador para efetuar limpezas no sistema."
+            Write-Host "DICA: Você pode abrir o PowerShell diretamente como Administrador ou confirmar a janela UAC.`n" -ForegroundColor Yellow
+            $argumentos = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+            foreach ($k in $PSBoundParameters.Keys) {
+                if ($PSBoundParameters[$k] -is [switch] -and $PSBoundParameters[$k].IsPresent) {
+                    $argumentos += "-$k"
+                } elseif ($PSBoundParameters[$k] -isnot [switch]) {
+                    $argumentos += "-$k"; $argumentos += "`"$($PSBoundParameters[$k])`""
+                }
+            }
+            try {
+                Start-Process powershell.exe -ArgumentList $argumentos -Verb RunAs -ErrorAction Stop
+                Write-Host "Janela elevada iniciada. Ela permanecerá aberta até você pressionar Enter ao final." -ForegroundColor Green
+                exit 0
+            } catch {
+                Write-Error "Não foi possível abrir janela elevada automaticamente: $($_.Exception.Message)"
+                Write-Host "Para executar, abra o PowerShell como Administrador e execute: `"$PSCommandPath`"" -ForegroundColor Yellow
+                exit 1
+            }
+        } else {
+            throw "Execute este script em uma janela do PowerShell como Administrador."
+        }
     }
 }
 
@@ -355,20 +370,35 @@ Write-Host "         DIAGNÓSTICO: TOP $TopFilesCount MAIORES ARQUIVOS NA UNIDAD
 Write-Host "==============================================================================" -ForegroundColor Cyan
 Write-Host "Localizando grandes arquivos soltos (> 100 MB)..." -ForegroundColor Gray
 
-$pastasIgnoradas = @('C:\Windows\WinSxS', 'C:\$Recycle.Bin', 'C:\System Volume Information')
-$grandesArquivos = Get-ChildItem -Path "C:\" -File -Recurse -Force -ErrorAction SilentlyContinue |
-    Where-Object {
-        $itemPath = $_.FullName
-        $ignorar = $false
-        foreach ($p in $pastasIgnoradas) {
-            if ($itemPath.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) { $ignorar = $true; break }
-        }
-        (-not $ignorar) -and ($_.Length -gt 100MB)
-    } |
+# Varre pastas principais evitando varrer recursivamente a pasta Windows inteira
+$pastasAlvo = @("C:\Users", "C:\ProgramData", "C:\Windows\Temp", "C:\Windows\Logs")
+$pastasRaiz = Get-ChildItem -Path "C:\" -Directory -Attributes !ReparsePoint -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notin @('Windows', 'Users', 'ProgramData', 'Program Files', 'Program Files (x86)', '$Recycle.Bin', 'System Volume Information', '$WINDOWS.~BT', 'Recovery') } |
+    ForEach-Object { $_.FullName }
+if ($pastasRaiz) { $pastasAlvo += $pastasRaiz }
+
+$grandesArquivos = [System.Collections.Generic.List[PSObject]]::new()
+
+# Arquivos na raiz de C:
+Get-ChildItem -Path "C:\" -File -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Length -gt 100MB } | ForEach-Object { $grandesArquivos.Add($_) }
+
+# Dumps no Windows
+Get-ChildItem -Path "C:\Windows" -File -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '\.(dmp|log)$' -and $_.Length -gt 100MB } | ForEach-Object { $grandesArquivos.Add($_) }
+
+foreach ($pasta in $pastasAlvo) {
+    if (Test-Path -LiteralPath $pasta) {
+        Get-ChildItem -LiteralPath $pasta -File -Recurse -Attributes !ReparsePoint -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 100MB } | ForEach-Object { $grandesArquivos.Add($_) }
+    }
+}
+
+$grandesArquivos = $grandesArquivos |
     Sort-Object Length -Descending |
     Select-Object -First $TopFilesCount
 
-if ($grandesArquivos) {
+if ($grandesArquivos -and $grandesArquivos.Count -gt 0) {
     $grandesArquivos | Select-Object @{Name="Tamanho"; Expression={ Format-Tamanho $_.Length }},
                                      @{Name="Última Modificação"; Expression={ $_.LastWriteTime.ToString('dd/MM/yyyy HH:mm') }},
                                      @{Name="Caminho Completo"; Expression={ $_.FullName }} |
@@ -401,3 +431,9 @@ if ($Mode -ne 'Analyze') {
     Write-Host "`nModo Análise finalizado. Nenhuma alteração foi realizada em disco." -ForegroundColor Yellow
 }
 Write-Host "==============================================================================" -ForegroundColor Cyan
+
+if ($Host.Name -match 'ConsoleHost' -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+    Write-Host "`nPressione Enter para fechar esta janela..." -ForegroundColor Gray
+    Read-Host | Out-Null
+}
+
