@@ -1,3 +1,12 @@
 *.bak
 *.csv
 *.log
+*.pfx
+*.key
+*.pem
+*.cer
+*.crt
+*.pst
+*.creds
+.vscode/
+.idea/

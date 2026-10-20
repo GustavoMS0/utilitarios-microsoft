@@ -236,6 +236,11 @@ try {
         Write-Host "`n=== $script:caixa ===" -ForegroundColor Cyan
         $script:stats = @{ Novos = 0; Atualizados = 0; Removidos = 0; Falhas = 0; Bytes = 0 }
 
+        if ($script:caixa -notmatch '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$') {
+            Write-Warning "Caixa '$script:caixa' ignorada: formato de e-mail invalido."
+            continue
+        }
+
         try {
             $script:dirCaixa  = Join-Path $Destino $script:caixa.ToLower()
             $script:arqEstado = Join-Path $script:dirCaixa 'estado.json'
